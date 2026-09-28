@@ -1,0 +1,20 @@
+[Unit]
+Description=MAXCOURSE private print SSH reverse tunnel
+After=network-online.target maxcourse-print-agent.service
+Wants=network-online.target
+
+[Service]
+User=maxcourse-print
+Group=maxcourse-print
+EnvironmentFile=/etc/maxcourse-print-agent/tunnel.env
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o UserKnownHostsFile=/var/lib/maxcourse-print-agent/known_hosts -i /var/lib/maxcourse-print-agent/tunnel_key -R 127.0.0.1:18765:127.0.0.1:18765 ${PRINT_TUNNEL_USER}@${PRINT_TUNNEL_HOST}
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
