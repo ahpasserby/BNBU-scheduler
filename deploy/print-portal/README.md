@@ -4,9 +4,9 @@
 
 ## 数据流与范围
 
-1. 用户使用已绑定学校账号的 MAXCOURSE 会话登录。后端从用户表取得学校账号，不接受前端指定其他账号。
-2. 选择 PDF 后，设备检查页数、加密状态和文件有效性。后端签发绑定用户、文件哈希和页数的短期检查凭证。
-3. 用户确认页数及固定打印设置，输入本次学校密码，再提交。文档与密码仅在同步请求中流转，设备离线不排队保存。
+1. 学生在同一个表单选择 PDF、填写学校账号和密码，点击一次“提交打印”。已有会话与所填学校账号一致时直接使用；否则调用现有学校登录接口验证身份，无需另开登录弹窗或重复填写密码。
+2. 账号确认后，设备检查实际页数、加密状态和文件有效性。后端签发绑定用户、学校身份、文件哈希及页数的短期检查凭证。
+3. 前端继续使用同一次填写的密码提交文件。后端只使用会话绑定的学校身份。请求完成后清空密码，文档与密码不排队持久保存。
 4. 学校服务确认传输后，状态为“已交给学校队列”。用户需要本人刷卡取件。网站无法确认释放、纸张输出或扣费。
 
 首版支持 PDF，10 MiB 以内、最多 50 页、A4、灰度、单面、单份。没有价格估算或站内付款。任务状态保留约 24 小时，服务运行时每分钟清理过期记录，读取时也会清理。文件名、文件内容和学校密码不存入任务数据库。设备临时文档位于 systemd 创建的 `/run/maxcourse-print-agent`，完成或异常后清理，服务停止及重启也会清理运行目录。
@@ -72,18 +72,35 @@ MAXCOURSE_PRINT_AGENT_TOKEN=THE_SAME_PRIVATE_TOKEN
 
 ## 验收
 
-先保持 `MAXCOURSE_PRINT_ENABLED=0` 发布页面或本地预览，再部署设备和隧道。检查设备离线时不可提交。上线前验证两个学校账号互相看不到任务、错误密码不会自动重试、异常 PDF 被拒绝、重复请求只发送一次、发送后断线仍可查询、进程重启时不重发、文档和密码没有写入持久存储。
+先保持 `MAXCOURSE_PRINT_ENABLED=0` 验收前端，再部署设备和隧道。检查设备离线时不可提交。上线前验证两个学校账号互相看不到任务、错误密码不会自动重试、异常 PDF 被拒绝、重复请求只发送一次、发送后断线仍可查询、进程重启时不重发、文档和密码没有写入持久存储。
 
 最后用本人学校账号提交一张真实文件，核对本人刷卡列表和实物。此前命令行测试成功不代替这条网页、私有通道及执行端的完整验收。
 
 关闭入口可将 `MAXCOURSE_PRINT_ENABLED=0` 后重启云端服务。停用设备服务会清理临时文档，但已经送到学校队列的作业仍须在学校端处理，不能把停服务解释为取消学校作业。
 
-## 本地预览与回归
+## 本地应用与前端验收
 
 ```bash
 python deploy/print-portal/preview.py --port 5019
 ```
 
-预览固定绑定 `127.0.0.1`，使用临时数据库与模拟执行端，页面持续标明本地演示。演示登录为 `demo` / `demo`，默认已登录，不需要填写真实学校密码。预览不会发送真实打印任务，不得作为生产 WSGI 应用启动。
+本地实例固定绑定 `127.0.0.1`，加载实际 `app.py` 和打印接口，数据库与会话隔离。没有模拟执行端、预置学校账号或虚构任务。设备未配置时页面显示“打印服务未连接”，仍可选择文件并检查界面。关闭本地进程后清理该实例的临时数据库。首页和电脑配置指南同样由实际应用提供。
 
-后端检查：`python -m pytest tests/test_campus_print.py -q`。浏览器验收使用 `browser-checks.js`，从仓库根目录运行 Playwright CLI，将 `tests/fixtures/print-portal.pdf` 分别复制为 `.codex/slow.pdf` 和 `.codex/fast.pdf` 后，在已打开预览页面的会话中执行 `run-code --filename=deploy/print-portal/browser-checks.js`。真实设备的沙箱、隧道、证书、两个学校账号及实体打印仍需上线前验收。
+后端检查：`python -m pytest tests/test_campus_print.py tests/test_print_portal_integration.py -q`。浏览器验收使用 `browser-checks.js`，从仓库根目录运行 Playwright CLI。先准备以下仅用于浏览器检查的合成文件，再在已打开本地页面的独立测试浏览器中执行 `run-code --filename=deploy/print-portal/browser-checks.js`。
+
+自动化脚本仅在测试浏览器内拦截接口响应，以验证成功、账号错误、断线与重复请求等交互，不向学校发送凭据或打印任务。检查完成后移除拦截并返回实际服务状态。这些响应不进入用户看到的本地服务。
+
+```bash
+mkdir -p .codex
+cp tests/fixtures/print-portal.pdf .codex/slow.pdf
+cp tests/fixtures/print-portal.pdf .codex/fast.pdf
+python - <<'PYTEST'
+from pathlib import Path
+Path('.codex/broken.pdf').write_bytes(b'not-pdf')
+with open('.codex/too-big.pdf', 'wb') as fixture:
+    fixture.write(b'%PDF-1.7')
+    fixture.truncate(10485761)
+PYTEST
+```
+
+实机沙箱、隧道、证书、两个学校账号及实体打印仍需上线前验收。
