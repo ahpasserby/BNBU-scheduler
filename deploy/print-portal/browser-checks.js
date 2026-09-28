@@ -9,6 +9,7 @@ async (page) => {
   // reach school authentication and no request reaches a real print agent.
   let user = null, jobs = [], online = true, failLogin = false, reply = 'submitted';
   let loginCalls = 0, inspectionCalls = 0;
+  let holdLogin = null;
   const posts = [];
   let holdHistory = null;
   let historyStarted = false;
@@ -24,6 +25,7 @@ async (page) => {
     });
     if (path === '/api/login/ispace') {
       loginCalls++;
+      if (holdLogin) await holdLogin;
       if (failLogin) return json({ error: 'Invalid credentials' }, 401);
       const input = req.postDataJSON();
       user = { id: input.username === 't_test2' ? 2 : 1, school_username: input.username };
@@ -57,21 +59,41 @@ async (page) => {
   const fill = async (account = 't_test1') => {
     await page.locator('#file-input').setInputFiles(fixture);
     await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
+    await page.locator('#go-print').click();
     await page.getByLabel('学号', { exact: true }).fill(account);
     await page.getByLabel('密码', { exact: true }).fill('test-only');
   };
   await reset();
-  assert(await page.locator('#school-username').isVisible(), 'School account is hidden behind login');
-  assert(await page.locator('#school-password').isVisible(), 'Password should be immediately visible');
+  assert(await page.locator('#school-username').isHidden(), 'Account requested before document selection');
+  assert(await page.locator('#school-password').isHidden(), 'Password requested before printing');
   assert(await page.locator('#history').isHidden(), 'Empty history should not clutter the page');
   assert(!/演示同学|本地演示|demo/.test(await page.locator('body').innerText()), 'Demo content in product');
-  await page.getByRole('button', { name: '提交打印', exact: true }).click();
-  await page.getByText('先选择一份需要打印的 PDF。', { exact: true }).waitFor();
+  assert(await page.locator('#go-print').isDisabled(), 'Continue must require a document');
   assert(posts.length === 0, 'Validation submitted a print job');
 
   await fill();
+  assert(await page.locator('#confirm-name').textContent() === 'print-portal.pdf', 'Confirmation lost filename');
+  assert(loginCalls === 0 && inspectionCalls === 0 && posts.length === 0, 'Opening account step sent credentials or PDF');
+  await page.locator('#account-back').click();
+  assert(await page.locator('#account-dialog').isHidden(), 'Back did not close account step');
+  assert(await page.locator('#doc-name').textContent() === 'print-portal.pdf', 'Back lost selected file');
+  assert(await page.locator('#school-password').inputValue() === '', 'Back retained password');
+  await page.locator('#go-print').click();
+  await page.getByLabel('密码', { exact:true }).fill('test-only');
+  await page.keyboard.press('Escape');
+  assert(await page.locator('#account-dialog').isHidden(), 'Escape did not close account step');
+  assert(await page.locator('#school-password').inputValue() === '', 'Escape retained password');
+  await page.locator('#go-print').click();
+  await page.getByLabel('密码', { exact:true }).fill('test-only');
+  let releaseLogin;
+  holdLogin = new Promise(resolve => { releaseLogin = resolve; });
   const beforeLogin = loginCalls;
   await page.locator('#submit-form').evaluate(form => { form.requestSubmit(); form.requestSubmit(); });
+  await page.getByText('正在验证学校账号…', {exact:true}).first().waitFor();
+  await page.keyboard.press('Escape');
+  assert(await page.locator('#account-dialog').isVisible(), 'In-flight submission was dismissed');
+  assert(await page.locator('#account-back').isDisabled(), 'In-flight back control must be disabled');
+  releaseLogin(); holdLogin = null;
   await page.getByRole('heading', { name: '文件已提交，去刷卡取件吧' }).waitFor();
   assert(posts.length === 1 && loginCalls === beforeLogin + 1 && inspectionCalls === 1, 'Expected single login-inspect-submit pipeline');
   assert(posts[0].passwordPresent && posts[0].user === '1', 'Wrong dispatch credentials or owner');
@@ -112,6 +134,7 @@ async (page) => {
   await page.reload(); await page.getByText('打印服务未连接', { exact: true }).waitFor();
   await fill();
   assert(await page.locator('#submit-btn').isDisabled(), 'Offline submission should be disabled');
+  await page.locator('#account-back').click();
   online = true; await page.locator('#service-refresh').click();
   await page.getByText('打印服务已连接', { exact: true }).waitFor();
 
@@ -131,7 +154,7 @@ async (page) => {
   });
   await page.locator('#file-input').setInputFiles('.codex/slow.pdf');
   await page.locator('#file-input').setInputFiles('.codex/fast.pdf');
-  await page.getByText('fast.pdf', { exact: true }).waitFor();
+  await page.locator('#doc-name').filter({hasText:'fast.pdf'}).waitFor();
   await page.waitForTimeout(600);
   assert(await page.locator('#doc-name').textContent() === 'fast.pdf', 'Late read replaced current file');
 
@@ -148,6 +171,9 @@ async (page) => {
   await page.locator('#jobs-refresh').click();
   for (let i=0; i<100 && !historyStarted; i++) await page.waitForTimeout(20);
   assert(historyStarted, 'History request did not start');
+  await page.locator('#file-input').setInputFiles(fixture);
+  await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
+  await page.locator('#go-print').click();
   await page.getByLabel('学号', { exact: true }).fill('t_test2');
   release(); await page.waitForTimeout(100);
   assert(await page.locator('#history').isHidden(), 'Old-account history reappeared');
@@ -159,13 +185,19 @@ async (page) => {
   assert(await page.locator('#help-dialog').isHidden(), 'Escape did not dismiss help');
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.screenshot({ path:'output/playwright/print-portal/redesign-desktop.png', fullPage:true });
-  await fill();
+  await page.locator('#file-input').setInputFiles(fixture);
+  await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
+  assert(await page.locator('#school-username').isHidden(), 'Selecting a file automatically requested credentials');
   await page.screenshot({ path:'output/playwright/print-portal/redesign-selected.png', fullPage:true });
+  await page.locator('#go-print').click();
+  await page.screenshot({ path:'output/playwright/print-portal/two-step-account.png', fullPage:true });
   for (const width of [375, 768, 1024]) {
     await page.setViewportSize({ width, height: 900 });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Horizontal overflow at '+width);
   }
   await page.setViewportSize({ width:375, height:812 });
+  await page.screenshot({ path:'output/playwright/print-portal/two-step-mobile-account.png', fullPage:true });
+  await page.locator('#account-back').click();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-mobile.png', fullPage:true });
   await page.emulateMedia({ reducedMotion:'reduce' });
   assert(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches), 'Reduced motion missing');
@@ -176,5 +208,5 @@ async (page) => {
   await page.goto(origin+'/print/');
   await page.getByText('打印服务未连接', { exact:true }).waitFor();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-real.png', fullPage:true });
-  return { passed:true, scenarios:14, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
+  return { passed:true, scenarios:16, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
 }
