@@ -68,7 +68,7 @@ async (page) => {
   assert(await page.locator('#school-password').isHidden(), 'Password requested before printing');
   assert(await page.locator('#history').isHidden(), 'Empty history should not clutter the page');
   assert(!/演示同学|本地演示|demo/.test(await page.locator('body').innerText()), 'Demo content in product');
-  assert(await page.locator('#go-print').isDisabled(), 'Continue must require a document');
+  assert(await page.locator('#doc-panel').isHidden(), 'Preview must wait for a document');
   assert(posts.length === 0, 'Validation submitted a print job');
 
   await fill();
@@ -140,7 +140,7 @@ async (page) => {
 
   await page.locator('#doc-remove').click();
   await page.locator('#file-input').setInputFiles('.codex/broken.pdf');
-  await page.getByText('无法读取这份 PDF，请重新选择或导出文件。', { exact: true }).waitFor();
+  await page.locator('#file-error').filter({hasText:/无法生成|无法读取/}).waitFor();
   await page.locator('#file-input').setInputFiles('.codex/too-big.pdf');
   await page.getByText('文件超过 10 MB，请压缩 PDF 后再试。', { exact: true }).waitFor();
 
@@ -156,7 +156,36 @@ async (page) => {
   await page.locator('#file-input').setInputFiles('.codex/fast.pdf');
   await page.locator('#doc-name').filter({hasText:'fast.pdf'}).waitFor();
   await page.waitForTimeout(600);
+  await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
   assert(await page.locator('#doc-name').textContent() === 'fast.pdf', 'Late read replaced current file');
+
+  // Real local renderer: multi-page navigation, A4 output, zoom and validation.
+  await page.locator('#file-input').setInputFiles('tests/fixtures/print-preview-pages.pdf');
+  await page.locator('#doc-sub').filter({hasText:'2 页'}).waitFor();
+  await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
+  assert(await page.locator('#print-total').textContent() === '2 页 / 2 张', 'Incorrect print summary');
+  const firstPixels = await page.locator('#preview-canvas').evaluate(canvas => canvas.toDataURL());
+  await page.locator('#page-next').click();
+  await page.locator('#preview-canvas[data-page="2"]').waitFor({state:'visible'});
+  const secondPixels = await page.locator('#preview-canvas').evaluate(canvas => canvas.toDataURL());
+  assert(firstPixels !== secondPixels, 'Page navigation did not change rendered content');
+  await page.locator('#page-current').fill('999');
+  await page.locator('#page-current').press('Enter');
+  assert(await page.locator('#page-current').inputValue() === '2', 'Page bounds not reflected in control');
+  assert(await page.locator('#preview-canvas').evaluate(c => c.height > c.width), 'Landscape source was not fitted to portrait A4');
+  await page.locator('#preview-zoom').selectOption('1.5');
+  await page.locator('#preview-canvas').waitFor({state:'visible'});
+  assert(await page.locator('#preview-canvas').evaluate(c => parseFloat(c.style.width)>800), 'Zoom did not enlarge the real canvas');
+  await page.locator('#page-current').fill('1');
+  await page.locator('#page-current').press('Enter');
+  await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
+  assert(await page.locator('#account-dialog').isHidden(), 'Page jump unexpectedly opened account confirmation');
+  await page.locator('#file-input').setInputFiles('.codex/encrypted.pdf');
+  await page.locator('#file-error').filter({hasText:'加密 PDF'}).waitFor();
+  assert(await page.locator('#doc-panel').isHidden(), 'Encrypted document remained printable');
+  await page.locator('#file-input').setInputFiles('.codex/too-many-pages.pdf');
+  await page.locator('#file-error').filter({hasText:'51 页'}).waitFor();
+  assert(await page.locator('#doc-panel').isHidden(), 'Over-limit document remained printable');
 
   await reset();
   // Realistic authenticated history remains collapsed and follows the typed ID.
@@ -188,6 +217,7 @@ async (page) => {
   await page.locator('#file-input').setInputFiles(fixture);
   await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
   assert(await page.locator('#school-username').isHidden(), 'Selecting a file automatically requested credentials');
+  assert(await page.locator('#preview-canvas').isVisible(), 'Actual PDF preview missing');
   await page.screenshot({ path:'output/playwright/print-portal/redesign-selected.png', fullPage:true });
   await page.locator('#go-print').click();
   await page.screenshot({ path:'output/playwright/print-portal/two-step-account.png', fullPage:true });
@@ -196,6 +226,7 @@ async (page) => {
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Horizontal overflow at '+width);
   }
   await page.setViewportSize({ width:375, height:812 });
+  await page.waitForFunction(() => { const c=document.getElementById('preview-canvas'),h=document.getElementById('page-stage'); return !c.hidden && parseFloat(c.style.width) <= h.clientWidth; });
   await page.screenshot({ path:'output/playwright/print-portal/two-step-mobile-account.png', fullPage:true });
   await page.locator('#account-back').click();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-mobile.png', fullPage:true });
@@ -208,5 +239,5 @@ async (page) => {
   await page.goto(origin+'/print/');
   await page.getByText('打印服务未连接', { exact:true }).waitFor();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-real.png', fullPage:true });
-  return { passed:true, scenarios:16, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
+  return { passed:true, scenarios:20, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
 }

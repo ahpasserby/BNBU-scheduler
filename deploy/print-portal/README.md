@@ -4,8 +4,8 @@
 
 ## 数据流与范围
 
-1. 学生先选择 PDF，点击“去打印”后才在确认弹窗中填写学校账号和密码，再点击“提交打印”。已有会话与所填学校账号一致时直接使用；否则调用现有学校登录接口验证身份，无需预先登录或重复填写密码。返回文档或按 Esc 关闭确认弹窗时，保留文件并清空密码。
-2. 账号确认后，设备检查实际页数、加密状态和文件有效性。后端签发绑定用户、学校身份、文件哈希及页数的短期检查凭证。
+1. 学生选择 PDF 后先进入本地打印预览，核对实际页面、页数与输出规格。点击“确认打印”后才填写学校账号和密码，再点击“提交打印”。已有会话与所填学校账号一致时直接使用；否则调用现有学校登录接口验证身份，无需预先登录或重复填写密码。返回文档或按 Esc 关闭确认弹窗时，保留文件并清空密码。
+2. 本地预览先检查 PDF 与页数，账号确认后设备仍独立检查实际页数、加密状态和文件有效性。后端签发绑定用户、学校身份、文件哈希及页数的短期检查凭证。
 3. 前端继续使用同一次填写的密码提交文件。后端只使用会话绑定的学校身份。请求完成后清空密码，文档与密码不排队持久保存。
 4. 学校服务确认传输后，状态为“已交给学校队列”。用户需要本人刷卡取件。网站无法确认释放、纸张输出或扣费。
 
@@ -78,6 +78,12 @@ MAXCOURSE_PRINT_AGENT_TOKEN=THE_SAME_PRIVATE_TOKEN
 
 关闭入口可将 `MAXCOURSE_PRINT_ENABLED=0` 后重启云端服务。停用设备服务会清理临时文档，但已经送到学校队列的作业仍须在学校端处理，不能把停服务解释为取消学校作业。
 
+## 本地 PDF 预览
+
+`print/pdf-preview.js` 使用固定版本的 `vendor/pdfjs-6.3.289/`，包括 worker、CMap、标准字体和图像解码资源。部署必须一并传输这些文件，保留原许可证；无需 npm 运行时安装或 CDN。升级库时更换版本目录及代码路径，避免原有长期缓存。
+
+浏览器从本地文件缓冲区解析和绘制真实页面，按 A4 居中适配并以灰度显示。预览未发送文件到服务器，实际提交仍调用设备校验接口。字体和解析实现与 Ghostscript 不同，预览不能替代最终输出验收。
+
 ## 本地应用与前端验收
 
 ```bash
@@ -100,6 +106,16 @@ Path('.codex/broken.pdf').write_bytes(b'not-pdf')
 with open('.codex/too-big.pdf', 'wb') as fixture:
     fixture.write(b'%PDF-1.7')
     fixture.truncate(10485761)
+from pypdf import PdfReader, PdfWriter
+writer = PdfWriter()
+for page in PdfReader('tests/fixtures/print-preview-pages.pdf').pages:
+    writer.add_page(page)
+writer.encrypt('synthetic-test-password')
+writer.write('.codex/encrypted.pdf')
+writer = PdfWriter()
+for _ in range(51):
+    writer.add_blank_page(width=595, height=842)
+writer.write('.codex/too-many-pages.pdf')
 PYTEST
 ```
 
