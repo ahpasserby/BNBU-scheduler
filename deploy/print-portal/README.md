@@ -21,7 +21,7 @@
 sudo bash deploy/print-portal/install-agent.sh /path/to/checkout
 ```
 
-安装脚本建立 `maxcourse-print` 非登录用户，安装 Python、Samba 客户端、Ghostscript、Poppler 和 Bubblewrap。PDF 解析及转换在无网络的 Bubblewrap 环境运行，只挂载系统运行库、字体与当前任务目录；子进程另有 CPU、地址空间、输出文件和超时限制。若系统禁用用户命名空间导致沙箱不可用，执行端保持未就绪，不降级到无沙箱执行。
+安装脚本建立 `maxcourse-print` 非登录用户，安装 Python、Samba 客户端、Ghostscript、Poppler 和 Bubblewrap。PDF 解析及转换在无网络的 Bubblewrap 环境运行，只挂载系统运行库、字体与当前任务目录；子进程另有 CPU、地址空间、输出文件和超时限制。若系统禁用用户命名空间导致沙箱不可用，执行端保持未就绪，不降级到无沙箱执行。实机上的 Bubblewrap 0.12 需要 `openat2` 和独立的 `/proc` 挂载，因此父服务不启用会阻断这两项操作的 `RestrictSUIDSGID`、`ProtectKernelTunables`。专用非特权用户、`NoNewPrivileges`、只读系统目录、Bubblewrap 用户及 PID 命名空间、无网络转换和资源上限继续生效。
 
 唯一设备令牌由安装脚本写入 `/etc/maxcourse-print-agent/agent.env`，权限为 root `0600`。不要把令牌打印、提交到 Git、放进网页或日志。将同一令牌安全配置到云端服务环境。安装脚本还会生成执行端 TLS 证书和私钥，私钥只允许服务用户读取。将公开的 `agent.crt` 通过已验证的 SSH 通道复制到云端，作为该执行端的专用 CA 文件，不能关闭 TLS 校验。证书有效期为两年，到期前需重新签发并更新云端信任文件。
 
@@ -66,7 +66,7 @@ MAXCOURSE_PRINT_AGENT_TOKEN=THE_SAME_PRIVATE_TOKEN
 
 不要把占位值原样部署。测试模式不能在生产启用。云端仅允许配置回环 HTTPS 执行端，并校验专用执行端证书，同时关闭 Requests 的环境代理继承和自动重定向。即使另一进程占用了同一个回环端口，也无法冒充执行端读取学校密码。公共 API 需要有效登录、学校身份、CSRF、同源检查、页数检查凭证、限流和任务所有权。
 
-现有 Flask 单进程服务会在一次提交中等待设备处理，最长约 150 秒。反向代理的打印 API 请求超时需至少 180 秒，body limit 为 16 MiB，保留 HTTPS。将本目录 `nginx-location-settings.conf` 的指令应用在打印 API 的代理 location 内，保留现有上游、头部、WAF 和限流配置，再运行 `nginx -t`。
+现有 Flask 单进程服务会在一次提交中等待设备处理，最长约 150 秒。反向代理的打印 API 请求超时需至少 180 秒，body limit 为 16 MiB，保留 HTTPS。将本目录 `nginx-location-settings.conf` 的指令应用在打印 API 的代理 location 内，保留现有上游、头部、WAF 和限流配置，再运行 `nginx -t`。当前宝塔部署的完整打印 location 见 `nginx-production-location.conf`，应用到该站点的扩展目录。主机同时存在两个 Nginx，本站使用 `/www/server/nginx/sbin/nginx` 与 `/www/server/nginx/conf/nginx.conf`，验证及重载必须明确指定这一实例。
 
 必须关闭请求体磁盘缓冲，并使用 HTTP/1.1 转发和足够的内存缓冲，避免包含学校密码的 JSON 或 PDF 被写入 Nginx 的请求体临时目录。不要开启请求正文日志或把完整请求发送到错误监控。部署验收需一并检查代理层，不只检查 Flask。未来扩大吞吐量时应扩展执行端容量，不能直接重试不确定的任务。
 

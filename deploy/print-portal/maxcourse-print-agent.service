@@ -20,10 +20,14 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-ProtectKernelTunables=yes
+# Bubblewrap mounts a private /proc inside its own user/PID namespace.
+# Masking the parent /proc prevents that mount on the supported ARM kernel.
+ProtectKernelTunables=no
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# This filter returns ENOSYS for openat2, which Bubblewrap 0.12 requires.
+# NoNewPrivileges and the unprivileged service account remain enforced.
+RestrictSUIDSGID=no
 LockPersonality=yes
 MemoryMax=512M
 TasksMax=64
