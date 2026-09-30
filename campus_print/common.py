@@ -1,12 +1,20 @@
 import base64
 import binascii
 import hashlib
+import json
 import re
 
 MAX_BYTES = 10 * 1024 * 1024
 MAX_PAGES = 50
+MAX_COPIES = 20
+# Printed faces per job (pages x copies), so a typo cannot empty a paper tray.
+MAX_IMPRESSIONS = 200
 RETENTION_SECONDS = 86400
-CAPABILITIES = {"paper": "A4", "color": "grayscale", "sides": "one-sided", "copies": 1}
+COLORS = ("grayscale", "color")
+SIDES = ("one-sided", "two-sided-long-edge", "two-sided-short-edge")
+DEFAULT_OPTIONS = {"color": "grayscale", "sides": "one-sided", "copies": 1}
+# Output features an agent must advertise before the cloud forwards them.
+FEATURES = ("color", "duplex", "copies")
 USERNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 JOB_ID = re.compile(r"[a-f0-9]{32}\Z")
 MESSAGES = {
@@ -26,7 +34,9 @@ MESSAGES = {
     "conversion_failed": "文件转换失败，没有提交到学校队列。",
     "restarted": "设备在提交前重启，本次没有发送到学校队列。",
     "bad_input": "请求参数不正确，请刷新后重试。",
-    "conflict": "同一任务编号对应的文件发生变化，请检查任务记录。",
+    "conflict": "同一任务编号对应的文件或打印设置发生变化，请检查任务记录。",
+    "unsupported_option": "打印设备暂不支持所选设置，请调整后再试。",
+    "too_many_impressions": f"单次最多打印 {MAX_IMPRESSIONS} 面，请减少份数后再试。",
 }
 
 
@@ -54,8 +64,53 @@ def decode_pdf(value):
     return content
 
 
-def fingerprint(content, username):
-    return hashlib.sha256(username.encode() + b"\0" + content).hexdigest()
+def parse_options(value, features=FEATURES):
+    """Validate output options; anything beyond the defaults needs a feature."""
+    if value is None:
+        return dict(DEFAULT_OPTIONS)
+    if not isinstance(value, dict) or not set(value) <= set(DEFAULT_OPTIONS):
+        raise PrintError("bad_input")
+    options = DEFAULT_OPTIONS | value
+    copies = options["copies"]
+    if options["color"] not in COLORS or options["sides"] not in SIDES or type(copies) is not int or not 1 <= copies <= MAX_COPIES:
+        raise PrintError("bad_input")
+    needed = {"color"} if options["color"] != "grayscale" else set()
+    needed |= {"duplex"} if options["sides"] != "one-sided" else set()
+    needed |= {"copies"} if copies != 1 else set()
+    if not needed <= set(features):
+        raise PrintError("unsupported_option", 422)
+    return options
+
+
+def encode_options(options):
+    return "" if options == DEFAULT_OPTIONS else json.dumps(options, sort_keys=True, separators=(",", ":"))
+
+
+def decode_options(text):
+    try:
+        return parse_options(json.loads(text)) if text else dict(DEFAULT_OPTIONS)
+    except (ValueError, PrintError):
+        return dict(DEFAULT_OPTIONS)
+
+
+def capabilities(features):
+    features = set(features)
+    return {
+        "paper": "A4",
+        "color": list(COLORS) if "color" in features else ["grayscale"],
+        "sides": list(SIDES) if "duplex" in features else ["one-sided"],
+        "copies": {"min": 1, "max": MAX_COPIES if "copies" in features else 1},
+        "max_impressions": MAX_IMPRESSIONS,
+    }
+
+
+def fingerprint(content, username, options=None):
+    # Default options keep the original digest, so earlier intents still match.
+    digest = hashlib.sha256(username.encode() + b"\0" + content)
+    extra = encode_options(options or DEFAULT_OPTIONS)
+    if extra:
+        digest.update(b"\0" + extra.encode())
+    return digest.hexdigest()
 
 
 def public_job(row):
@@ -67,4 +122,5 @@ def public_job(row):
     code = row["code"]
     return {key: row[key] for key in (
         "id", "idempotency_key", "pages", "created_at", "updated_at"
-    )} | {"state": state, "code": code, "message": MESSAGES.get(code, MESSAGES["unknown"])}
+    )} | {"state": state, "code": code, "message": MESSAGES.get(code, MESSAGES["unknown"]),
+          "options": decode_options(row["options"] if "options" in row.keys() else "")}

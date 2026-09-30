@@ -11,9 +11,34 @@
 3. 前端继续使用同一次填写的密码提交文件。后端只使用会话绑定的学校身份。请求完成后清空密码，文档与密码不排队持久保存。
 4. 学校服务确认传输后，状态为“已交给学校队列”。用户需要本人刷卡取件。网站无法确认释放、纸张输出或扣费。
 
-首版支持 PDF，10 MiB 以内、最多 50 页、A4、灰度、单面、单份。没有价格估算或站内付款。任务状态保留约 24 小时，服务运行时每分钟清理过期记录，读取时也会清理。文件名、文件内容和学校密码不存入任务数据库。设备临时文档位于 systemd 创建的 `/run/maxcourse-print-agent`，完成或异常后清理，服务停止及重启也会清理运行目录。
+支持 PDF，10 MiB 以内、最多 50 页、A4 输出。可选黑白或彩色、单面或双面（长边或短边翻页）、1 至 20 份，单次最多 200 面（页数乘以份数）。默认仍为黑白、单面、单份。没有价格估算或站内付款。任务状态保留约 24 小时，服务运行时每分钟清理过期记录，读取时也会清理。文件名、文件内容和学校密码不存入任务数据库。设备临时文档位于 systemd 创建的 `/run/maxcourse-print-agent`，完成或异常后清理，服务停止及重启也会清理运行目录。
 
 每个明确的提交意图有一个幂等编号，云端和执行端都去重。提交途中断线或执行端在发送时重启会保留“结果待确认”，不会自动重发。学校明确拒绝认证时才显示密码验证失败。
+
+## 打印选项与执行端能力
+
+打印选项只在执行端声明支持后开放。执行端的 `/v1/health` 返回 `features`（`color`、`duplex`、`copies`）；云端只转发执行端声明过的选项，未声明时拒绝非默认选项（`unsupported_option`）。旧版执行端没有该字段，页面把彩色、双面和多份显示为“设备暂不支持”，默认规格照常提交，不会出现选了彩色却按黑白输出的情况。
+
+打印选项属于提交意图的一部分：同一幂等编号若更换选项，返回冲突；任务记录只保存颜色、单双面和份数，不保存文件信息。默认选项的指纹与旧版一致，升级前后的任务可以继续查询。
+
+执行端转换规则：
+
+- 黑白：与原先的命令完全相同，`ps2write` 加 `-sColorConversionStrategy=Gray`。
+- 彩色：改用 `-sColorConversionStrategy=RGB -dProcessColorModel=/DeviceRGB`，保留原色。
+- 双面与份数：在 `%%EndProlog` 与第一页之间插入标准 DSC `%%BeginSetup` 段，写入 `<</Duplex true /Tumble …>>`、`<</Collate true>>` 与 `<</NumCopies n>>`，每项都有 `stopped` 保护，与 CUPS 驱动的写法一致。若输出中找不到插入位置，任务按转换失败处理，不发送。
+
+本地已用 Ghostscript 10.08 核对：彩色输出保留青、品红、黄墨量，黑白只有黑色；设置段在每页的纸张尺寸设置之前执行且不会被覆盖。学校打印机是否执行双面、分份装订以及彩色计费，只能以实物验收为准，见下方升级步骤。
+
+## 升级执行端
+
+云端随主分支自动部署；执行端需要单独升级，完成前页面保持选项禁用。在香橙派上更新仓库后运行：
+
+```bash
+sudo bash deploy/print-portal/install-agent.sh /path/to/checkout
+sudo systemctl restart maxcourse-print-agent.service
+```
+
+安装脚本会覆盖 `/opt/maxcourse-print-agent/campus_print`，保留现有令牌、证书和环境文件。升级后在云端确认 `/api/print/session` 的 `service.features` 包含三项，再用本人账号分别实物验收：彩色一页、双面长边与短边各一份双页文档、两份双页文档（核对是否按份装订），并核对学校系统中的彩色计费。任一项实物结果不符，可回退执行端代码，页面会自动恢复为仅默认规格。
 
 ## 部署香橘派
 
@@ -84,7 +109,7 @@ MAXCOURSE_PRINT_AGENT_TOKEN=THE_SAME_PRIVATE_TOKEN
 
 `print/pdf-preview.js` 使用固定版本的 `vendor/pdfjs-6.3.289/`，包括 worker、CMap、标准字体和图像解码资源。部署必须一并传输这些文件，保留原许可证；无需 npm 运行时安装或 CDN。升级库时更换版本目录及代码路径，避免原有长期缓存。
 
-浏览器从本地文件缓冲区解析和绘制真实页面，按 A4 居中适配并以灰度显示。预览未发送文件到服务器，实际提交仍调用设备校验接口。字体和解析实现与 Ghostscript 不同，预览不能替代最终输出验收。
+浏览器从本地文件缓冲区解析和绘制真实页面，按 A4 居中适配，按所选颜色显示黑白或彩色；双面时可翻面查看背面页，多份时以叠放纸张表示。预览未发送文件到服务器，实际提交仍调用设备校验接口。字体和解析实现与 Ghostscript 不同，预览不能替代最终输出验收。
 
 ## 本地应用与前端验收
 
@@ -118,6 +143,10 @@ writer = PdfWriter()
 for _ in range(51):
     writer.add_blank_page(width=595, height=842)
 writer.write('.codex/too-many-pages.pdf')
+writer = PdfWriter()
+for _ in range(50):
+    writer.add_blank_page(width=595, height=842)
+writer.write('.codex/fifty-pages.pdf')
 PYTEST
 ```
 

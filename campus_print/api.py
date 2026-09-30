@@ -12,7 +12,7 @@ from flask import Blueprint, current_app, jsonify, request, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .client import AgentClient
-from .common import CAPABILITIES, JOB_ID, MAX_BYTES, MAX_PAGES, MESSAGES, USERNAME, PrintError, decode_pdf, fingerprint, public_job
+from .common import DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_IMPRESSIONS, MAX_PAGES, MESSAGES, USERNAME, PrintError, capabilities, decode_pdf, encode_options, fingerprint, parse_options, public_job
 from .store import Store
 from .maintenance import start_cleaner
 
@@ -60,14 +60,17 @@ def create_blueprint(db_path):
 
     def service():
         enabled = current_app.config.get('PRINT_ENABLED', os.getenv('MAXCOURSE_PRINT_ENABLED', '0') == '1')
-        result = dict(enabled=bool(enabled), online=False, ready=False, busy=False, demo=False, message='打印服务准备中，暂不接收任务。')
+        result = dict(enabled=bool(enabled), online=False, ready=False, busy=False, demo=False, features=[], message='打印服务准备中，暂不接收任务。')
         if enabled:
             try:
                 health = agent().health()
                 if health.get('demo') and not current_app.testing:
                     return result
+                features = health.get('features')
+                # Agents before output options report none and keep the fixed defaults.
                 result.update(online=True, ready=health.get('ready') is True, busy=health.get('busy') is True,
-                              demo=health.get('demo') is True)
+                              demo=health.get('demo') is True,
+                              features=[f for f in FEATURES if isinstance(features, list) and f in features])
                 result['message'] = '可以提交打印' if result['ready'] and not result['busy'] else MESSAGES['busy' if result['busy'] else 'offline']
             except Exception:
                 result['message'] = MESSAGES['offline']
@@ -79,6 +82,7 @@ def create_blueprint(db_path):
             raise PrintError('offline', 503)
         if status['busy']:
             raise PrintError('busy', 503)
+        return status
 
     def ticket_signer():
         return URLSafeTimedSerializer(current_app.secret_key, salt='campus-print-inspection-v1')
@@ -148,8 +152,10 @@ def create_blueprint(db_path):
     def get_session():
         if 'print_csrf' not in session:
             session['print_csrf'] = secrets.token_urlsafe(32)
-        return jsonify(csrf_token=session['print_csrf'], user=current_user(False), service=service(),
-                       limits={'max_bytes': MAX_BYTES, 'max_pages': MAX_PAGES}, capabilities=CAPABILITIES)
+        status = service()
+        return jsonify(csrf_token=session['print_csrf'], user=current_user(False), service=status,
+                       limits={'max_bytes': MAX_BYTES, 'max_pages': MAX_PAGES, 'max_impressions': MAX_IMPRESSIONS},
+                       capabilities=capabilities(status['features']))
 
     @bp.post('/inspect')
     def inspect():
@@ -179,7 +185,8 @@ def create_blueprint(db_path):
         if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', key):
             raise PrintError('bad_input')
         content = decode_pdf(data.get('pdf'))
-        digest = fingerprint(content, user['school_username'])
+        options = parse_options(data.get('options'))
+        digest = fingerprint(content, user['school_username'], options)
         previous = store().get_key(key, user['id'])
         if previous:
             if previous['fingerprint'] != digest:
@@ -194,13 +201,19 @@ def create_blueprint(db_path):
         password = data.get('password')
         if not isinstance(password, str) or not 1 <= len(password) <= 512 or any(c in password for c in '\r\n\x00'):
             raise PrintError('password_required')
-        ready()
-        row, created = store().create(secrets.token_hex(16), user['id'], key, digest, inspected['pages'])
+        if inspected['pages'] * options['copies'] > MAX_IMPRESSIONS:
+            raise PrintError('too_many_impressions', 422)
+        # Only forward options the connected agent advertises; older agents ignore unknown fields.
+        parse_options(options, ready()['features'])
+        row, created = store().create(secrets.token_hex(16), user['id'], key, digest, inspected['pages'], encode_options(options))
         if not created:
             return jsonify(job=public_job(reconcile(row)))
+        payload = {'id': row['id'], 'owner': user['id'], 'username': user['school_username'],
+                   'password': password, 'pdf': data['pdf']}
+        if options != DEFAULT_OPTIONS:
+            payload['options'] = options
         try:
-            result = agent().submit({'id': row['id'], 'owner': user['id'], 'username': user['school_username'],
-                                     'password': password, 'pdf': data['pdf']})
+            result = agent().submit(payload)
             row = apply_result(row, result)
         except PrintError as exc:
             # Busy/offline rejects before accepting a job; other failures may be ambiguous.
@@ -210,6 +223,7 @@ def create_blueprint(db_path):
             row = store().update(row['id'], user['id'], 'unknown', 'unknown')
         finally:
             data.pop('password', None)
+            payload.pop('password', None)
             password = None
         return jsonify(job=public_job(row)), 202 if row['state'] in ('unknown','processing') else 200
 

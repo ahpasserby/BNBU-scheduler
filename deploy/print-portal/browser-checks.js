@@ -7,7 +7,8 @@ async (page) => {
   const fixture = 'tests/fixtures/print-portal.pdf';
   // Every API request in this browser session is intercepted. No credentials
   // reach school authentication and no request reaches a real print agent.
-  let user = null, jobs = [], online = true, failLogin = false, reply = 'submitted';
+  const allFeatures = ['color', 'duplex', 'copies'];
+  let user = null, jobs = [], online = true, failLogin = false, reply = 'submitted', features = allFeatures;
   let loginCalls = 0, inspectionCalls = 0;
   let holdLogin = null;
   const posts = [];
@@ -19,9 +20,11 @@ async (page) => {
     const json = (data, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) });
     if (path === '/api/print/session') return json({
       csrf_token: 'browser-test-token', user,
-      service: { enabled: true, ready: online, online, busy: false, demo: false },
-      limits: { max_bytes: 10485760, max_pages: 50 },
-      capabilities: { paper: 'A4', color: 'grayscale', sides: 'one-sided', copies: 1 },
+      service: { enabled: true, ready: online, online, busy: false, demo: false, features: online ? features : [] },
+      limits: { max_bytes: 10485760, max_pages: 50, max_impressions: 200 },
+      capabilities: { paper: 'A4', color: features.includes('color') ? ['grayscale', 'color'] : ['grayscale'],
+        sides: features.includes('duplex') ? ['one-sided', 'two-sided-long-edge', 'two-sided-short-edge'] : ['one-sided'],
+        copies: { min: 1, max: features.includes('copies') ? 20 : 1 }, max_impressions: 200 },
     });
     if (path === '/api/login/ispace') {
       loginCalls++;
@@ -37,10 +40,10 @@ async (page) => {
     }
     if (path === '/api/print/jobs' && req.method() === 'POST') {
       const input = req.postDataJSON();
-      posts.push({ key: input.idempotency_key, passwordPresent: input.password === 'test-only', user: req.headers()['x-print-user'] });
+      posts.push({ key: input.idempotency_key, passwordPresent: input.password === 'test-only', user: req.headers()['x-print-user'], options: input.options });
       if (reply === 'timeout') return route.fulfill({ status: 504, contentType: 'text/plain', body: 'Gateway timeout' });
       const job = { id: String(posts.length).padStart(32, '0'), idempotency_key: input.idempotency_key,
-        state: reply, pages: 1, created_at: Date.now() / 1000, updated_at: Date.now() / 1000 };
+        state: reply, pages: 1, options: input.options, created_at: Date.now() / 1000, updated_at: Date.now() / 1000 };
       jobs = [job, ...jobs];
       return json({ job });
     }
@@ -52,7 +55,7 @@ async (page) => {
     return json({ error: 'Blocked test request' }, 404);
   });
   const reset = async () => {
-    user = null; jobs = []; online = true; failLogin = false; reply = 'submitted';
+    user = null; jobs = []; online = true; failLogin = false; reply = 'submitted'; features = allFeatures;
     await page.goto(origin + '/print/');
     await page.getByText('打印服务已连接', { exact: true }).waitFor();
   };
@@ -75,13 +78,13 @@ async (page) => {
   assert(await page.locator('#confirm-name').textContent() === 'print-portal.pdf', 'Confirmation lost filename');
   assert(loginCalls === 0 && inspectionCalls === 0 && posts.length === 0, 'Opening account step sent credentials or PDF');
   await page.locator('#account-back').click();
-  assert(await page.locator('#account-dialog').isHidden(), 'Back did not close account step');
+  await page.locator('#account-dialog').waitFor({ state: 'hidden', timeout: 2000 });
   assert(await page.locator('#doc-name').textContent() === 'print-portal.pdf', 'Back lost selected file');
   assert(await page.locator('#school-password').inputValue() === '', 'Back retained password');
   await page.locator('#go-print').click();
   await page.getByLabel('密码', { exact:true }).fill('test-only');
   await page.keyboard.press('Escape');
-  assert(await page.locator('#account-dialog').isHidden(), 'Escape did not close account step');
+  await page.locator('#account-dialog').waitFor({ state: 'hidden', timeout: 2000 });
   assert(await page.locator('#school-password').inputValue() === '', 'Escape retained password');
   await page.locator('#go-print').click();
   await page.getByLabel('密码', { exact:true }).fill('test-only');
@@ -111,6 +114,7 @@ async (page) => {
   assert(posts.length === countBeforeQuery, 'Query must not send another job');
   await page.locator('#receipt-retry').click();
   assert(await page.locator('#school-username').isDisabled(), 'Retry identity must stay bound');
+  assert(await page.getByRole('radio', { name: '彩色' }).isDisabled(), 'Retry settings must stay bound');
   reply = 'submitted';
   await page.getByLabel('密码', { exact: true }).fill('test-only');
   await page.locator('#submit-btn').click();
@@ -135,6 +139,7 @@ async (page) => {
   await fill();
   assert(await page.locator('#submit-btn').isDisabled(), 'Offline submission should be disabled');
   await page.locator('#account-back').click();
+  await page.locator('#account-dialog').waitFor({ state: 'hidden', timeout: 2000 });
   online = true; await page.locator('#service-refresh').click();
   await page.getByText('打印服务已连接', { exact: true }).waitFor();
 
@@ -163,7 +168,8 @@ async (page) => {
   await page.locator('#file-input').setInputFiles('tests/fixtures/print-preview-pages.pdf');
   await page.locator('#doc-sub').filter({hasText:'2 页'}).waitFor();
   await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
-  assert(await page.locator('#print-total').textContent() === '2 页 / 2 张', 'Incorrect print summary');
+  await page.waitForFunction(() => document.getElementById('print-total-sheets').textContent === '2');
+  assert(await page.locator('#print-total').textContent() === '2 页 × 1 份 · 共 2 面', 'Incorrect print summary');
   const firstPixels = await page.locator('#preview-canvas').evaluate(canvas => canvas.toDataURL());
   await page.locator('#page-next').click();
   await page.locator('#preview-canvas[data-page="2"]').waitFor({state:'visible'});
@@ -173,9 +179,13 @@ async (page) => {
   await page.locator('#page-current').press('Enter');
   assert(await page.locator('#page-current').inputValue() === '2', 'Page bounds not reflected in control');
   assert(await page.locator('#preview-canvas').evaluate(c => c.height > c.width), 'Landscape source was not fitted to portrait A4');
-  await page.locator('#preview-zoom').selectOption('1.5');
-  await page.locator('#preview-canvas').waitFor({state:'visible'});
-  assert(await page.locator('#preview-canvas').evaluate(c => parseFloat(c.style.width)>800), 'Zoom did not enlarge the real canvas');
+  await page.locator('#zoom-in').click();
+  await page.locator('#zoom-fit').filter({hasText:'100%'}).waitFor();
+  await page.locator('#zoom-in').click();
+  await page.locator('#zoom-fit').filter({hasText:'150%'}).waitFor();
+  await page.waitForFunction(() => parseFloat(document.getElementById('preview-canvas').style.width) > 800);
+  await page.locator('#zoom-fit').click();
+  await page.locator('#zoom-fit').filter({hasText:'适合'}).waitFor();
   await page.locator('#page-current').fill('1');
   await page.locator('#page-current').press('Enter');
   await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
@@ -186,6 +196,68 @@ async (page) => {
   await page.locator('#file-input').setInputFiles('.codex/too-many-pages.pdf');
   await page.locator('#file-error').filter({hasText:'51 页'}).waitFor();
   assert(await page.locator('#doc-panel').isHidden(), 'Over-limit document remained printable');
+
+  // Output options change the preview and travel with the print intent.
+  await reset();
+  await page.locator('#file-input').setInputFiles('tests/fixtures/print-preview-pages.pdf');
+  await page.locator('#preview-canvas[data-page="1"]').waitFor();
+  await page.getByRole('radio', { name: '彩色' }).check();
+  assert(await page.locator('#sheet').evaluate(s => s.classList.contains('is-color')), 'Colour did not reach the preview');
+  await page.getByRole('radio', { name: '双面' }).check();
+  await page.locator('#flip-group').waitFor({ state: 'visible' });
+  await page.locator('#back-canvas[data-page="2"]').waitFor({ state: 'attached' });
+  await page.getByRole('radio', { name: '短边翻页' }).check();
+  assert(await page.locator('#sheet').getAttribute('data-flip') === 'short', 'Short-edge flip not previewed');
+  await page.locator('#copies-inc').click();
+  await page.locator('#copies-inc').click();
+  assert(await page.locator('#copies').inputValue() === '3', 'Copies stepper failed');
+  assert(await page.locator('#sheet-wrap').getAttribute('data-copies') === '3', 'Copies stack missing');
+  await page.waitForFunction(() => document.getElementById('print-total-sheets').textContent === '3');
+  assert(await page.locator('#print-total').textContent() === '2 页 × 3 份 · 共 6 面', 'Duplex summary incorrect');
+  await page.waitForTimeout(2400); // Let the one-time duplex demonstration flip settle.
+  assert(await page.locator('#flip-sheet').getAttribute('aria-pressed') === 'false', 'Demonstration flip did not return');
+  await page.locator('#flip-sheet').click();
+  assert(await page.locator('#page-current').inputValue() === '2', 'Back side did not show page 2');
+  assert(await page.locator('#sheet-caption').textContent() === '背面', 'Back side caption missing');
+  await page.locator('#go-print').click();
+  assert((await page.locator('#confirm-specs').textContent()).includes('彩色 · 双面 · 短边 · 3 份'), 'Confirmation lost options');
+  await page.getByLabel('学号', { exact: true }).fill('t_test1');
+  await page.getByLabel('密码', { exact: true }).fill('test-only');
+  await page.locator('#submit-btn').click();
+  await page.getByRole('heading', { name: '文件已提交，去刷卡取件吧' }).waitFor();
+  const sent = posts.at(-1).options;
+  assert(sent.color === 'color' && sent.sides === 'two-sided-short-edge' && sent.copies === 3, 'Options were not submitted');
+  assert((await page.locator('#receipt-details').textContent()).includes('彩色 · 双面 · 短边 · 3 份'), 'Receipt lost options');
+  await page.screenshot({ path:'output/playwright/print-portal/options-receipt.png', fullPage:true });
+
+  // Older agents without output features keep the fixed defaults and say so.
+  await reset(); features = [];
+  await page.reload(); await page.getByText('打印服务已连接', { exact: true }).waitFor();
+  await page.locator('#file-input').setInputFiles(fixture);
+  await page.locator('#preview-canvas[data-page="1"]').waitFor();
+  assert(await page.getByRole('radio', { name: '彩色' }).isDisabled(), 'Unsupported colour stayed selectable');
+  assert(await page.getByRole('radio', { name: '双面' }).isDisabled(), 'Unsupported duplex stayed selectable');
+  assert(await page.locator('#copies-inc').isDisabled(), 'Unsupported copies stayed adjustable');
+  assert(await page.locator('#color-note').textContent() === '设备暂不支持彩色', 'Missing unsupported note');
+  // Options chosen while offline revert once the device reports its features.
+  online = false; await page.locator('#doc-remove').click();
+  await page.reload(); await page.getByText('打印服务未连接', { exact: true }).waitFor();
+  await page.locator('#file-input').setInputFiles(fixture);
+  await page.locator('#preview-canvas[data-page="1"]').waitFor();
+  await page.getByRole('radio', { name: '彩色' }).check();
+  online = true; await page.locator('#service-refresh').click();
+  await page.getByText('打印服务已连接', { exact: true }).waitFor();
+  assert(await page.getByRole('radio', { name: '黑白' }).isChecked(), 'Unsupported colour was not reverted');
+
+  // The copy cap follows the 200-face limit for long documents.
+  await reset();
+  await page.locator('#file-input').setInputFiles('.codex/fifty-pages.pdf');
+  await page.locator('#doc-sub').filter({hasText:'50 页'}).waitFor();
+  await page.locator('#copies').fill('9');
+  await page.locator('#copies').press('Enter');
+  assert(await page.locator('#copies').inputValue() === '4', 'Copies not capped at 200 faces');
+  assert(await page.locator('#copies-inc').isDisabled(), 'Copy cap still adjustable');
+  assert(await page.locator('#copies-note').textContent() === '最多 4 份', 'Copy cap note missing');
 
   await reset();
   // Realistic authenticated history remains collapsed and follows the typed ID.
@@ -211,7 +283,7 @@ async (page) => {
   await page.locator('#help-open').click();
   assert(await page.locator('#help-dialog').isVisible(), 'Help modal failed');
   await page.keyboard.press('Escape');
-  assert(await page.locator('#help-dialog').isHidden(), 'Escape did not dismiss help');
+  await page.locator('#help-dialog').waitFor({ state: 'hidden', timeout: 2000 });
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.screenshot({ path:'output/playwright/print-portal/redesign-desktop.png', fullPage:true });
   await page.locator('#file-input').setInputFiles(fixture);
@@ -239,5 +311,5 @@ async (page) => {
   await page.goto(origin+'/print/');
   await page.getByText('打印服务未连接', { exact:true }).waitFor();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-real.png', fullPage:true });
-  return { passed:true, scenarios:20, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
+  return { passed:true, scenarios:24, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
 }

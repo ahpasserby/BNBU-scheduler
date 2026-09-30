@@ -21,9 +21,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from campus_print import create_print_blueprint
-from campus_print.agent import PrintAgent, handler_for
+from campus_print.agent import PrintAgent, add_setup, device_features, handler_for
 from campus_print.client import AgentClient
-from campus_print.common import PrintError
+from campus_print.common import DEFAULT_OPTIONS, PrintError, parse_options
 from campus_print.store import Store
 
 PDF = base64.b64encode(b'%PDF-1.4\nsynthetic-api-boundary-fixture\n%%EOF').decode()
@@ -37,16 +37,20 @@ class FakeAgent:
         self.calls = 0
         self.jobs = {}
         self.usernames = []
+        self.options = []
+        self.features = []
+        self.pages = 2
 
     def health(self):
-        return {'ready': self.ready, 'busy': self.busy, 'demo': True}
+        return {'ready': self.ready, 'busy': self.busy, 'demo': True, 'features': self.features}
 
     def inspect(self, pdf):
-        return {'pages': 2}
+        return {'pages': self.pages}
 
     def submit(self, data):
         self.calls += 1
         self.usernames.append(data['username'])
+        self.options.append(data.get('options'))
         if self.fail:
             raise self.fail
         job = {'id': data['id'], 'state': 'submitted', 'code': 'submitted'}
@@ -196,6 +200,48 @@ class PrintAPITests(unittest.TestCase):
             conn.execute('UPDATE campus_print_jobs SET created_at=0')
         self.assertEqual(Store(self.db).list(2), [])
 
+    def test_output_options_wait_for_agent_features(self):
+        caps = self.client.get('/api/print/session').json['capabilities']
+        self.assertEqual((caps['color'], caps['sides'], caps['copies']['max']), (['grayscale'], ['one-sided'], 1))
+        data = self.payload()
+        data['options'] = {'color': 'color'}
+        result = self.post('jobs', data)
+        self.assertEqual((result.status_code, result.json['code']), (422, 'unsupported_option'))
+        self.assertEqual((self.agent.calls, Store(self.db).list(1)), (0, []))
+
+    def test_supported_options_are_forwarded_stored_and_bound_to_intent(self):
+        self.agent.features = ['color', 'duplex', 'copies', 'future-feature']
+        state = self.client.get('/api/print/session').json
+        self.assertEqual(state['service']['features'], ['color', 'duplex', 'copies'])
+        self.assertIn('two-sided-short-edge', state['capabilities']['sides'])
+        self.assertEqual(state['limits']['max_impressions'], 200)
+        chosen = {'color': 'color', 'sides': 'two-sided-long-edge', 'copies': 3}
+        data = self.payload()
+        data['options'] = chosen
+        job = self.post('jobs', data).json['job']
+        self.assertEqual((job['state'], job['options']), ('submitted', chosen))
+        self.assertEqual(self.agent.options, [chosen])
+        self.assertEqual(self.client.get('/api/print/jobs').json['jobs'][0]['options'], chosen)
+        data['options'] = dict(chosen, copies=4)
+        self.assertEqual(self.post('jobs', data).status_code, 409)
+        self.assertEqual(self.agent.calls, 1)
+        plain = self.post('jobs', self.payload('test-idempotency-key-002')).json['job']
+        self.assertEqual((plain['options'], self.agent.options[-1]), (DEFAULT_OPTIONS, None))
+
+    def test_invalid_options_and_impression_limit(self):
+        self.agent.features = ['color', 'duplex', 'copies']
+        for options in ({'copies': 0}, {'copies': 21}, {'copies': '2'}, {'copies': True}, {'color': 'sepia'},
+                        {'sides': 'two-sided'}, {'staple': True}, ['color']):
+            data = self.payload()
+            data['options'] = options
+            self.assertEqual(self.post('jobs', data).status_code, 400, options)
+        self.agent.pages = 50
+        data = self.payload('test-idempotency-key-003')
+        data['options'] = {'copies': 5}
+        result = self.post('jobs', data)
+        self.assertEqual((result.status_code, result.json['code']), (422, 'too_many_impressions'))
+        self.assertEqual(self.agent.calls, 0)
+
     def test_deleted_user_metadata_is_removed(self):
         self.post('jobs', self.payload())
         with sqlite3.connect(self.db) as conn:
@@ -244,7 +290,7 @@ class AgentTests(unittest.TestCase):
 
     def test_duplicate_agent_dispatch_and_cleanup(self):
         data={'id':'c'*32,'owner':1,'username':'t100','password':'example','pdf':PDF}
-        def convert(folder, ident):
+        def convert(folder, ident, options):
             spool=folder/'job.ps'; spool.write_bytes(b'fixture'); return spool
         with mock.patch.object(self.agent,'health',return_value={'ready':True}), mock.patch.object(self.agent,'pdf_info',return_value=2), mock.patch.object(self.agent,'convert',side_effect=convert), mock.patch.object(self.agent,'send',return_value=('submitted','submitted')) as send:
             first=self.agent.submit(dict(data))
@@ -253,6 +299,75 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(second['state'],'submitted')
             self.assertEqual(send.call_count,1)
         self.assertEqual(list(self.agent.runtime_dir.iterdir()), [])
+
+    def test_health_advertises_output_features(self):
+        self.agent.last_probe=(float('inf'),True)
+        self.assertEqual(self.agent.health()['features'],['color','duplex','copies'])
+
+    def fake_ghostscript(self, body):
+        commands=[]
+        def run(command, timeout):
+            commands.append(command)
+            output=next(arg for arg in command if arg.startswith('-sOutputFile=/work/')).removeprefix('-sOutputFile=/work/')
+            (self.work/output).write_bytes(body)
+        return commands, mock.patch.object(self.agent,'run_limited',side_effect=run)
+
+    def test_conversion_applies_colour_duplex_and_collated_copies(self):
+        self.work=Path(self.tmp.name)/'work'; self.work.mkdir()
+        prolog=b'%!PS-Adobe-3.0\n%%EndComments\n%%BeginProlog\n/x 1 def\n%%EndProlog\n%%Page: 1 1\npage\n%%Trailer\n%%EOF\n'
+        commands, patch=self.fake_ghostscript(prolog)
+        with patch:
+            plain=self.agent.convert(self.work,'d'*32).read_bytes()
+            chosen=self.agent.convert(self.work,'d'*32,{'color':'color','sides':'two-sided-short-edge','copies':3}).read_bytes()
+        self.assertEqual(plain,prolog)
+        self.assertIn('-sColorConversionStrategy=Gray',commands[0])
+        self.assertIn('-sColorConversionStrategy=RGB',commands[1])
+        self.assertNotIn('-dProcessColorModel=/DeviceGray',commands[1])
+        setup=chosen[chosen.index(b'%%EndProlog'):chosen.index(b'%%Page: 1 1')]
+        for request in (b'<</Duplex true /Tumble true>> setpagedevice',b'<</Collate true>> setpagedevice',b'<</NumCopies 3>> setpagedevice',b'%%BeginSetup',b'%%EndSetup'):
+            self.assertIn(request,setup)
+        self.assertEqual(setup.count(b'stopped cleartomark'),3)
+        self.assertEqual(sorted(p.name for p in self.work.iterdir()),['maxcourse-'+'d'*32+'.ps'])
+
+    def test_existing_setup_section_is_extended_and_missing_position_fails(self):
+        self.work=Path(self.tmp.name)/'work'; self.work.mkdir()
+        spool=self.work/'job.ps'
+        spool.write_bytes(b'%!PS-Adobe-3.0\n%%EndProlog\n%%BeginSetup\nsetup\n%%EndSetup\n%%Page: 1 1\n')
+        add_setup(spool,device_features(dict(DEFAULT_OPTIONS,sides='two-sided-long-edge')))
+        text=spool.read_bytes()
+        self.assertEqual(text.count(b'%%BeginSetup'),1)
+        self.assertLess(text.index(b'/Tumble false'),text.index(b'%%EndSetup'))
+        self.assertEqual(device_features(DEFAULT_OPTIONS),b'')
+        spool.write_bytes(b'%!PS-Adobe-3.0\n%%Page: 1 1\n%%EndProlog\n')
+        with self.assertRaises(ValueError):
+            add_setup(spool,device_features(dict(DEFAULT_OPTIONS,copies=2)))
+        self.assertEqual(spool.read_bytes(),b'%!PS-Adobe-3.0\n%%Page: 1 1\n%%EndProlog\n')
+        self.assertEqual([p.name for p in self.work.iterdir()],['job.ps'])
+
+    def test_agent_validates_options_and_binds_them_to_the_job(self):
+        data={'id':'e'*32,'owner':1,'username':'t100','password':'example','pdf':PDF}
+        with self.assertRaises(PrintError) as caught:
+            self.agent.submit(dict(data,options={'copies':99}))
+        self.assertTrue(caught.exception.unaccepted)
+        def convert(folder, ident, options):
+            seen.append(options); spool=folder/'job.ps'; spool.write_bytes(b'fixture'); return spool
+        seen=[]
+        with mock.patch.object(self.agent,'health',return_value={'ready':True}), mock.patch.object(self.agent,'pdf_info',return_value=1), mock.patch.object(self.agent,'convert',side_effect=convert), mock.patch.object(self.agent,'send',return_value=('submitted','submitted')):
+            job=self.agent.submit(dict(data,options={'color':'color','copies':2}))
+            self.assertEqual(job['options'],{'color':'color','sides':'one-sided','copies':2})
+            with self.assertRaises(PrintError) as caught:
+                self.agent.submit(dict(data,options={'color':'color','copies':3}))
+        self.assertEqual(caught.exception.code,'conflict')
+        self.assertEqual(seen,[{'color':'color','sides':'one-sided','copies':2}])
+        self.assertEqual(parse_options(None),DEFAULT_OPTIONS)
+
+    def test_existing_job_table_gains_default_options(self):
+        path=str(Path(self.tmp.name)/'legacy.sqlite3')
+        with sqlite3.connect(path) as conn:
+            conn.execute('CREATE TABLE campus_print_jobs (id TEXT PRIMARY KEY, owner INTEGER NOT NULL, idempotency_key TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL, code TEXT NOT NULL, pages INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(owner, idempotency_key))')
+            conn.execute("INSERT INTO campus_print_jobs VALUES ('%s',1,'legacy-key-000001','digest','submitted','submitted',1,strftime('%%s','now'),strftime('%%s','now'))" % ('f'*32))
+        from campus_print.common import public_job
+        self.assertEqual(public_job(Store(path).get('f'*32,1))['options'],DEFAULT_OPTIONS)
 
     def test_atomic_cloud_reservation(self):
         barrier=threading.Barrier(2)

@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from .common import JOB_ID, MAX_PAGES, USERNAME, PrintError, decode_pdf, fingerprint, public_job
+from .common import DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_COPIES, MAX_PAGES, USERNAME, PrintError, decode_pdf, encode_options, fingerprint, parse_options, public_job
 from .store import Store
 from .maintenance import start_cleaner
 
@@ -86,7 +86,8 @@ class PrintAgent:
                     except OSError:
                         pass
                 self.last_probe = (time.monotonic(), online)
-        return {'ready': self.sandbox_ready and self.last_probe[1], 'busy': self.lock.locked(), 'demo': False}
+        return {'ready': self.sandbox_ready and self.last_probe[1], 'busy': self.lock.locked(), 'demo': False,
+                'features': list(FEATURES), 'max_copies': MAX_COPIES}
 
     def pdf_info(self, content, folder):
         (folder / 'document.pdf').write_bytes(content)
@@ -119,16 +120,24 @@ class PrintAgent:
         finally:
             self.lock.release()
 
-    def convert(self, folder, job_id):
+    def convert(self, folder, job_id, options=None):
+        options = options or DEFAULT_OPTIONS
         spool = folder / ('maxcourse-' + job_id + '.ps')
+        if options['color'] == 'color':
+            color = ['-sColorConversionStrategy=RGB', '-dProcessColorModel=/DeviceRGB']
+        else:
+            color = ['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray']
         command = ['/usr/bin/gs', '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-sDEVICE=ps2write',
-                   '-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray', '-sPAPERSIZE=a4',
+                   *color, '-sPAPERSIZE=a4',
                    '-dFIXEDMEDIA', '-dPDFFitPage', '-dNumCopies=1', '-dDuplex=false',
                    '-sOutputFile=/work/' + spool.name, '/work/document.pdf']
         self.run_limited(self.sandbox(folder, command), 55)
         with spool.open('rb') as stream:
             if stream.read(10) != b'%!PS-Adobe':
                 raise ValueError('Invalid converted PostScript')
+        features = device_features(options)
+        if features:
+            add_setup(spool, features)
         return spool
 
     def send(self, spool, username, password):
@@ -164,7 +173,11 @@ class PrintAgent:
         if not isinstance(ident, str) or not JOB_ID.fullmatch(ident) or type(owner) is not int or owner < 1 or not isinstance(username, str) or not USERNAME.fullmatch(username):
             raise PrintError('bad_input', 400, True)
         content = decode_pdf(data.get('pdf'))
-        digest = fingerprint(content, username)
+        try:
+            options = parse_options(data.get('options'))
+        except PrintError:
+            raise PrintError('bad_input', 400, True) from None
+        digest = fingerprint(content, username, options)
         old = self.store.get(ident, owner)
         if old:
             if old['fingerprint'] != digest:
@@ -181,11 +194,11 @@ class PrintAgent:
             with tempfile.TemporaryDirectory(dir=self.runtime_dir) as folder_name:
                 folder = Path(folder_name)
                 pages = self.pdf_info(content, folder)
-                row, fresh = self.store.create(ident, owner, ident, digest, pages)
+                row, fresh = self.store.create(ident, owner, ident, digest, pages, encode_options(options))
                 if not fresh:
                     return public_job(row)
                 try:
-                    spool = self.convert(folder, ident)
+                    spool = self.convert(folder, ident, options)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     return public_job(self.store.update(ident, owner, 'failed', 'conversion_failed'))
                 # Persist dispatch intent before handing any bytes to SMB.
@@ -208,6 +221,46 @@ class PrintAgent:
         with self.store.connect() as conn:
             row = conn.execute('SELECT * FROM campus_print_jobs WHERE id=?', (ident,)).fetchone()
             return public_job(row)
+
+
+def device_features(options):
+    """PostScript device requests for duplex and collated copies, in DSC form."""
+    features = []
+    if options['sides'] != 'one-sided':
+        tumble = options['sides'] == 'two-sided-short-edge'
+        features.append(('BeginFeature: *Duplex ' + ('DuplexTumble' if tumble else 'DuplexNoTumble'),
+                         '<</Duplex true /Tumble %s>> setpagedevice' % ('true' if tumble else 'false'), 'EndFeature'))
+    if options['copies'] != 1:
+        copies = int(options['copies'])
+        features.append(('BeginFeature: *Collate True', '<</Collate true>> setpagedevice', 'EndFeature'))
+        features.append(('BeginNonPPDFeature: NumCopies %d' % copies, '<</NumCopies %d>> setpagedevice' % copies, 'EndNonPPDFeature'))
+    # Each request is guarded, as printer drivers do, so an unsupported key cannot abort the job.
+    return ''.join('[{\n%%%%%s\n%s\n%%%%%s\n} stopped cleartomark\n' % (begin, code, end)
+                   for begin, code, end in features).encode()
+
+
+def add_setup(spool, features):
+    """Insert the device requests into the document setup, before the first page."""
+    target = spool.with_name(spool.stem + '-setup.ps')
+    try:
+        with spool.open('rb') as source, target.open('wb') as output:
+            prolog_done = in_setup = False
+            for line in source:
+                if in_setup and line.startswith(b'%%EndSetup'):
+                    output.write(features + line)
+                    break
+                if prolog_done and line.startswith(b'%%Page:'):
+                    output.write(b'%%BeginSetup\n' + features + b'%%EndSetup\n' + line)
+                    break
+                prolog_done = prolog_done or line.startswith(b'%%EndProlog')
+                in_setup = in_setup or (prolog_done and line.startswith(b'%%BeginSetup'))
+                output.write(line)
+            else:
+                raise ValueError('Converted PostScript has no document setup position')
+            shutil.copyfileobj(source, output)
+        target.replace(spool)
+    finally:
+        target.unlink(missing_ok=True)
 
 
 def handler_for(agent, token):

@@ -26,6 +26,11 @@ class Store:
                 CREATE INDEX IF NOT EXISTS campus_print_limits_lookup
                     ON campus_print_limits(owner,kind,at);
             ''')
+            try:
+                # Output options only (colour, sides, copies); never file details.
+                conn.execute("ALTER TABLE campus_print_jobs ADD COLUMN options TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
         self.prune()
 
     def prune(self):
@@ -57,7 +62,7 @@ class Store:
                 raise PrintError("rate_limited", 429)
             conn.execute('INSERT INTO campus_print_limits VALUES (?,?,?)', (owner, kind, int(time.time())))
 
-    def create(self, ident, owner, key, digest, pages):
+    def create(self, ident, owner, key, digest, pages, options=''):
         now = int(time.time())
         with self.connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -75,8 +80,9 @@ class Store:
                 raise PrintError('auth_rate_limited', 429)
             if count >= 10:
                 raise PrintError('rate_limited', 429)
-            conn.execute('INSERT INTO campus_print_jobs VALUES (?,?,?,?,?,?,?,?,?)',
-                         (ident, owner, key, digest, 'processing', 'processing', pages, now, now))
+            conn.execute('INSERT INTO campus_print_jobs (id,owner,idempotency_key,fingerprint,state,code,pages,created_at,updated_at,options) '
+                         'VALUES (?,?,?,?,?,?,?,?,?,?)',
+                         (ident, owner, key, digest, 'processing', 'processing', pages, now, now, options))
         return self.get(ident, owner), True
 
     def get(self, ident, owner):
