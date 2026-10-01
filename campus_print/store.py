@@ -40,7 +40,8 @@ class Store:
             conn.execute('DELETE FROM campus_print_limits WHERE at < ?', (now - 3600,))
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone():
                 conn.execute('DELETE FROM campus_print_jobs WHERE owner NOT IN (SELECT id FROM users)')
-                conn.execute('DELETE FROM campus_print_limits WHERE owner NOT IN (SELECT id FROM users)')
+                # Owners at or below zero are anonymous conversion buckets, not users.
+                conn.execute('DELETE FROM campus_print_limits WHERE owner > 0 AND owner NOT IN (SELECT id FROM users)')
 
     @contextmanager
     def connect(self):

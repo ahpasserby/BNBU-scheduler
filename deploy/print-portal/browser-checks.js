@@ -7,7 +7,22 @@ async (page) => {
   const fixture = 'tests/fixtures/print-portal.pdf';
   // Every API request in this browser session is intercepted. No credentials
   // reach school authentication and no request reaches a real print agent.
-  const allFeatures = ['color', 'duplex', 'copies'];
+  const allFeatures = ['color', 'duplex', 'copies', 'convert'];
+  // A small valid PDF stands in for the device's conversion result.
+  const convertedPdf = (() => {
+    const content = '0.2 0.4 0.8 rg 72 560 450 200 re f';
+    const objects = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>',
+      `<< /Length ${content.length} >>\nstream\n${content}\nendstream`];
+    let out = '%PDF-1.4\n';
+    const offsets = objects.map((body, index) => { const at = out.length; out += `${index + 1} 0 obj\n${body}\nendobj\n`; return at; });
+    const xref = out.length;
+    out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` + offsets.map(at => String(at).padStart(10, '0') + ' 00000 n \n').join('');
+    out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+    return Buffer.from(out).toString('base64');
+  })();
+  const docx = { name: 'report.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', buffer: Buffer.from('PK\u0003\u0004synthetic-docx') };
+  const converts = [];
   let user = null, jobs = [], online = true, failLogin = false, reply = 'submitted', features = allFeatures;
   let loginCalls = 0, inspectionCalls = 0;
   let holdLogin = null;
@@ -34,13 +49,17 @@ async (page) => {
       user = { id: input.username === 't_test2' ? 2 : 1, school_username: input.username };
       return json({ success: true });
     }
+    if (path === '/api/print/convert') {
+      converts.push(req.postDataJSON().name);
+      return json({ pdf: convertedPdf, pages: 1 });
+    }
     if (path === '/api/print/inspect') {
       inspectionCalls++;
       return json({ pages: 1, inspection_token: 'browser-inspection-ticket' });
     }
     if (path === '/api/print/jobs' && req.method() === 'POST') {
       const input = req.postDataJSON();
-      posts.push({ key: input.idempotency_key, passwordPresent: input.password === 'test-only', user: req.headers()['x-print-user'], options: input.options });
+      posts.push({ key: input.idempotency_key, passwordPresent: input.password === 'test-only', user: req.headers()['x-print-user'], options: input.options, pdf: input.pdf });
       if (reply === 'timeout') return route.fulfill({ status: 504, contentType: 'text/plain', body: 'Gateway timeout' });
       const job = { id: String(posts.length).padStart(32, '0'), idempotency_key: input.idempotency_key,
         state: reply, pages: 1, options: input.options, created_at: Date.now() / 1000, updated_at: Date.now() / 1000 };
@@ -57,11 +76,11 @@ async (page) => {
   const reset = async () => {
     user = null; jobs = []; online = true; failLogin = false; reply = 'submitted'; features = allFeatures;
     await page.goto(origin + '/print/');
-    await page.getByText('打印服务已连接', { exact: true }).waitFor();
+    await page.getByText('已连接', { exact: true }).waitFor();
   };
   const fill = async (account = 't_test1') => {
     await page.locator('#file-input').setInputFiles(fixture);
-    await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
+    await page.locator('#doc-sub').filter({hasText:/[KM]B/}).waitFor();
     await page.locator('#go-print').click();
     await page.getByLabel('学号', { exact: true }).fill(account);
     await page.getByLabel('密码', { exact: true }).fill('test-only');
@@ -135,19 +154,19 @@ async (page) => {
   assert(await page.locator('#school-password').inputValue() === '' && await page.locator('#school-password').getAttribute('type') === 'password', 'Account change retained password');
 
   await reset(); online = false;
-  await page.reload(); await page.getByText('打印服务未连接', { exact: true }).waitFor();
+  await page.reload(); await page.getByText('未连接', { exact: true }).waitFor();
   await fill();
   assert(await page.locator('#submit-btn').isDisabled(), 'Offline submission should be disabled');
   await page.locator('#account-back').click();
   await page.locator('#account-dialog').waitFor({ state: 'hidden', timeout: 2000 });
   online = true; await page.locator('#service-refresh').click();
-  await page.getByText('打印服务已连接', { exact: true }).waitFor();
+  await page.getByText('已连接', { exact: true }).waitFor();
 
   await page.locator('#doc-remove').click();
   await page.locator('#file-input').setInputFiles('.codex/broken.pdf');
   await page.locator('#file-error').filter({hasText:/无法生成|无法读取/}).waitFor();
   await page.locator('#file-input').setInputFiles('.codex/too-big.pdf');
-  await page.getByText('文件超过 10 MB，请压缩 PDF 后再试。', { exact: true }).waitFor();
+  await page.getByText('文件超过 10 MB，请压缩后再试。', { exact: true }).waitFor();
 
   // Exercise delayed FileReader completion after a newer selection.
   await page.evaluate(() => {
@@ -169,7 +188,7 @@ async (page) => {
   await page.locator('#doc-sub').filter({hasText:'2 页'}).waitFor();
   await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
   await page.waitForFunction(() => document.getElementById('print-total-sheets').textContent === '2');
-  assert(await page.locator('#print-total').textContent() === '2 页 × 1 份 · 共 2 面', 'Incorrect print summary');
+  assert(await page.locator('#print-total').textContent() === '2 页 × 1 份', 'Incorrect print summary');
   const firstPixels = await page.locator('#preview-canvas').evaluate(canvas => canvas.toDataURL());
   await page.locator('#page-next').click();
   await page.locator('#preview-canvas[data-page="2"]').waitFor({state:'visible'});
@@ -203,7 +222,7 @@ async (page) => {
   await page.locator('#preview-canvas[data-page="1"]').waitFor();
   await page.getByRole('radio', { name: '彩色' }).check();
   assert(await page.locator('#sheet').evaluate(s => s.classList.contains('is-color')), 'Colour did not reach the preview');
-  await page.getByRole('radio', { name: '双面' }).check();
+  await page.getByRole('radio', { name: '双面长边翻页' }).check();
   await page.locator('#flip-group').waitFor({ state: 'visible' });
   await page.locator('#back-canvas[data-page="2"]').waitFor({ state: 'attached' });
   await page.getByRole('radio', { name: '短边翻页' }).check();
@@ -213,7 +232,7 @@ async (page) => {
   assert(await page.locator('#copies').inputValue() === '3', 'Copies stepper failed');
   assert(await page.locator('#sheet-wrap').getAttribute('data-copies') === '3', 'Copies stack missing');
   await page.waitForFunction(() => document.getElementById('print-total-sheets').textContent === '3');
-  assert(await page.locator('#print-total').textContent() === '2 页 × 3 份 · 共 6 面', 'Duplex summary incorrect');
+  assert(await page.locator('#print-total').textContent() === '2 页 × 3 份', 'Duplex summary incorrect');
   await page.waitForTimeout(2400); // Let the one-time duplex demonstration flip settle.
   assert(await page.locator('#flip-sheet').getAttribute('aria-pressed') === 'false', 'Demonstration flip did not return');
   await page.locator('#flip-sheet').click();
@@ -230,23 +249,44 @@ async (page) => {
   assert((await page.locator('#receipt-details').textContent()).includes('彩色 · 双面 · 短边 · 3 份'), 'Receipt lost options');
   await page.screenshot({ path:'output/playwright/print-portal/options-receipt.png', fullPage:true });
 
+  // Word documents are converted on the device, previewed, then printed as that PDF.
+  await reset();
+  await page.locator('#file-input').setInputFiles(docx);
+  await page.locator('#preview-canvas[data-page="1"]').waitFor();
+  assert(converts.length === 1 && converts[0] === 'report.docx', 'Conversion request missing');
+  assert(await page.locator('#doc-name').textContent() === 'report.docx', 'Converted file lost its name');
+  assert((await page.locator('#doc-sub').textContent()).includes('已转为 PDF'), 'Conversion not indicated');
+  await page.locator('#go-print').click();
+  await page.getByLabel('学号', { exact: true }).fill('t_test1');
+  await page.getByLabel('密码', { exact: true }).fill('test-only');
+  await page.locator('#submit-btn').click();
+  await page.getByRole('heading', { name: '文件已提交，去刷卡取件吧' }).waitFor();
+  assert(posts.at(-1).pdf === convertedPdf, 'Converted PDF was not the printed document');
+  // Without the device conversion feature only PDF is accepted.
+  await reset(); features = ['color', 'duplex', 'copies'];
+  await page.reload(); await page.getByText('已连接', { exact: true }).waitFor();
+  assert(await page.locator('#drop-sub').textContent() === 'PDF 文件', 'Formats not limited to PDF');
+  await page.locator('#file-input').setInputFiles(docx);
+  await page.locator('#file-error').filter({ hasText: '暂不支持转换' }).waitFor();
+  assert(converts.length === 1, 'Unsupported conversion was attempted');
+
   // Older agents without output features keep the fixed defaults and say so.
   await reset(); features = [];
-  await page.reload(); await page.getByText('打印服务已连接', { exact: true }).waitFor();
+  await page.reload(); await page.getByText('已连接', { exact: true }).waitFor();
   await page.locator('#file-input').setInputFiles(fixture);
   await page.locator('#preview-canvas[data-page="1"]').waitFor();
   assert(await page.getByRole('radio', { name: '彩色' }).isDisabled(), 'Unsupported colour stayed selectable');
-  assert(await page.getByRole('radio', { name: '双面' }).isDisabled(), 'Unsupported duplex stayed selectable');
+  assert(await page.getByRole('radio', { name: '双面长边翻页' }).isDisabled(), 'Unsupported duplex stayed selectable');
   assert(await page.locator('#copies-inc').isDisabled(), 'Unsupported copies stayed adjustable');
   assert(await page.locator('#color-note').textContent() === '设备暂不支持彩色', 'Missing unsupported note');
   // Options chosen while offline revert once the device reports its features.
   online = false; await page.locator('#doc-remove').click();
-  await page.reload(); await page.getByText('打印服务未连接', { exact: true }).waitFor();
+  await page.reload(); await page.getByText('未连接', { exact: true }).waitFor();
   await page.locator('#file-input').setInputFiles(fixture);
   await page.locator('#preview-canvas[data-page="1"]').waitFor();
   await page.getByRole('radio', { name: '彩色' }).check();
   online = true; await page.locator('#service-refresh').click();
-  await page.getByText('打印服务已连接', { exact: true }).waitFor();
+  await page.getByText('已连接', { exact: true }).waitFor();
   assert(await page.getByRole('radio', { name: '黑白' }).isChecked(), 'Unsupported colour was not reverted');
 
   // The copy cap follows the 200-face limit for long documents.
@@ -273,7 +313,7 @@ async (page) => {
   for (let i=0; i<100 && !historyStarted; i++) await page.waitForTimeout(20);
   assert(historyStarted, 'History request did not start');
   await page.locator('#file-input').setInputFiles(fixture);
-  await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
+  await page.locator('#doc-sub').filter({hasText:/[KM]B/}).waitFor();
   await page.locator('#go-print').click();
   await page.getByLabel('学号', { exact: true }).fill('t_test2');
   release(); await page.waitForTimeout(100);
@@ -287,7 +327,7 @@ async (page) => {
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.screenshot({ path:'output/playwright/print-portal/redesign-desktop.png', fullPage:true });
   await page.locator('#file-input').setInputFiles(fixture);
-  await page.locator('#doc-sub').filter({hasText:/MB/}).waitFor();
+  await page.locator('#doc-sub').filter({hasText:/[KM]B/}).waitFor();
   assert(await page.locator('#school-username').isHidden(), 'Selecting a file automatically requested credentials');
   assert(await page.locator('#preview-canvas').isVisible(), 'Actual PDF preview missing');
   await page.screenshot({ path:'output/playwright/print-portal/redesign-selected.png', fullPage:true });
@@ -309,7 +349,7 @@ async (page) => {
   await page.unroute('**/api/**');
   await page.setViewportSize({ width:1440, height:960 });
   await page.goto(origin+'/print/');
-  await page.getByText('打印服务未连接', { exact:true }).waitFor();
+  await page.getByText('未连接', { exact:true }).waitFor();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-real.png', fullPage:true });
-  return { passed:true, scenarios:24, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
+  return { passed:true, scenarios:26, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
 }

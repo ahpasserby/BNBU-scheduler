@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from .common import DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_COPIES, MAX_PAGES, USERNAME, PrintError, decode_pdf, encode_options, fingerprint, parse_options, public_job
+from .common import CONVERT, DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_COPIES, MAX_PAGES, USERNAME, PrintError, decode_document, decode_pdf, encode_options, fingerprint, parse_options, public_job
 from .store import Store
 from .maintenance import start_cleaner
 
@@ -38,14 +38,17 @@ class PrintAgent:
         self.probe_lock = threading.Lock()
         self.last_probe = (0, False)
         self.sandbox_ready = self.check_sandbox()
+        # Conversion is offered only when LibreOffice is installed for the sandbox.
+        self.convert_ready = self.sandbox_ready and bool(shutil.which('soffice'))
 
-    def sandbox(self, workdir, args):
+    def sandbox(self, workdir, args, lang='C'):
         cmd = ['bwrap', '--unshare-all', '--die-with-parent', '--new-session']
-        for path in ('/usr', '/bin', '/lib', '/lib64', '/etc/fonts', '/etc/ghostscript'):
+        for path in ('/usr', '/bin', '/lib', '/lib64', '/etc/fonts', '/etc/ghostscript', '/etc/libreoffice',
+                     '/etc/alternatives', '/var/cache/fontconfig'):
             if Path(path).exists():
                 cmd += ['--ro-bind', path, path]
         cmd += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--bind', str(workdir), '/work',
-                '--chdir', '/work', '--clearenv', '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', 'C',
+                '--chdir', '/work', '--clearenv', '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', lang,
                 '--setenv', 'HOME', '/tmp', '--setenv', 'TMPDIR', '/tmp', '--'] + args
         return cmd
 
@@ -59,10 +62,11 @@ class PrintAgent:
         except (OSError, subprocess.SubprocessError):
             return False
 
-    def run_limited(self, command, timeout):
+    def run_limited(self, command, timeout, memory=None, cpu=None):
         env = {'PATH': '/usr/bin:/bin:/usr/sbin', 'LANG': 'C',
                'PYTHONPATH': str(Path(__file__).resolve().parent.parent)}
-        args = [sys.executable, '-m', 'campus_print.limits', '--'] + command
+        budget = (['--memory', str(memory)] if memory else []) + (['--cpu', str(cpu)] if cpu else [])
+        args = [sys.executable, '-m', 'campus_print.limits'] + budget + ['--'] + command
         # Regular, unlinked tmpfs files are bounded by the child's RLIMIT_FSIZE.
         # Do not accumulate attacker-controlled parser diagnostics in HTTP memory.
         with tempfile.TemporaryFile(dir=self.runtime_dir) as out, tempfile.TemporaryFile(dir=self.runtime_dir) as err:
@@ -87,7 +91,7 @@ class PrintAgent:
                         pass
                 self.last_probe = (time.monotonic(), online)
         return {'ready': self.sandbox_ready and self.last_probe[1], 'busy': self.lock.locked(), 'demo': False,
-                'features': list(FEATURES), 'max_copies': MAX_COPIES}
+                'features': list(FEATURES) + ([CONVERT] if self.convert_ready else []), 'max_copies': MAX_COPIES}
 
     def pdf_info(self, content, folder):
         (folder / 'document.pdf').write_bytes(content)
@@ -117,6 +121,41 @@ class PrintAgent:
         try:
             with tempfile.TemporaryDirectory(dir=self.runtime_dir) as name:
                 return {'pages': self.pdf_info(content, Path(name)), 'bytes': len(content)}
+        finally:
+            self.lock.release()
+
+    def convert_document(self, data):
+        """Convert one Office document or image to PDF inside the offline sandbox."""
+        try:
+            content, ext = decode_document(data.get('document'), 'input.' + str(data.get('ext', '')))
+        except PrintError as exc:
+            exc.unaccepted = True
+            raise
+        if not self.convert_ready:
+            raise PrintError('unsupported_format', 422, True)
+        if not self.lock.acquire(blocking=False):
+            raise PrintError('busy', 503, True)
+        try:
+            with tempfile.TemporaryDirectory(dir=self.runtime_dir) as name:
+                folder = Path(name)
+                (folder / 'out').mkdir()
+                (folder / ('input.' + ext)).write_bytes(content)
+                command = ['/usr/bin/soffice', '--headless', '--norestore', '--nolockcheck', '--nodefault', '--nologo',
+                           '-env:UserInstallation=file:///tmp/libreoffice', '--convert-to', 'pdf',
+                           '--outdir', '/work/out', '/work/input.' + ext]
+                try:
+                    self.run_limited(self.sandbox(folder, command, 'C.UTF-8'), 110, memory=1536, cpu=100)
+                except (OSError, subprocess.SubprocessError):
+                    raise PrintError('convert_failed', 422) from None
+                output = folder / 'out' / 'input.pdf'
+                if not output.is_file() or output.stat().st_size == 0:
+                    raise PrintError('convert_failed', 422)
+                if output.stat().st_size > MAX_BYTES:
+                    raise PrintError('too_large', 413)
+                pdf = output.read_bytes()
+                if not pdf.startswith(b'%PDF-'):
+                    raise PrintError('convert_failed', 422)
+                return {'pdf': base64.b64encode(pdf).decode(), 'pages': self.pdf_info(pdf, folder)}
         finally:
             self.lock.release()
 
@@ -315,7 +354,7 @@ def handler_for(agent, token):
         def process_post(self):
             data = {}
             try:
-                if self.path not in ('/v1/inspect', '/v1/jobs'):
+                if self.path not in ('/v1/inspect', '/v1/jobs', '/v1/convert'):
                     self.reply({'code': 'not_found', 'accepted': False}, 404)
                     return
                 if agent.lock.locked():
@@ -329,7 +368,8 @@ def handler_for(agent, token):
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise PrintError('bad_input', 400, True)
-                result = agent.inspect(data) if self.path == '/v1/inspect' else agent.submit(data)
+                handlers = {'/v1/inspect': agent.inspect, '/v1/jobs': agent.submit, '/v1/convert': agent.convert_document}
+                result = handlers[self.path](data)
                 self.reply(result)
             except PrintError as exc:
                 self.reply({'code': exc.code, 'accepted': not exc.unaccepted}, exc.status)

@@ -6,13 +6,14 @@ import secrets
 import sqlite3
 import time
 import threading
+import zlib
 from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, jsonify, request, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .client import AgentClient
-from .common import DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_IMPRESSIONS, MAX_PAGES, MESSAGES, USERNAME, PrintError, capabilities, decode_pdf, encode_options, fingerprint, parse_options, public_job
+from .common import CONVERT, DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_IMPRESSIONS, MAX_PAGES, MESSAGES, USERNAME, PrintError, capabilities, decode_document, decode_pdf, encode_options, fingerprint, parse_options, public_job
 from .store import Store
 from .maintenance import start_cleaner
 
@@ -70,7 +71,7 @@ def create_blueprint(db_path):
                 # Agents before output options report none and keep the fixed defaults.
                 result.update(online=True, ready=health.get('ready') is True, busy=health.get('busy') is True,
                               demo=health.get('demo') is True,
-                              features=[f for f in FEATURES if isinstance(features, list) and f in features])
+                              features=[f for f in FEATURES + (CONVERT,) if isinstance(features, list) and f in features])
                 result['message'] = '可以提交打印' if result['ready'] and not result['busy'] else MESSAGES['busy' if result['busy'] else 'offline']
             except Exception:
                 result['message'] = MESSAGES['offline']
@@ -101,6 +102,28 @@ def create_blueprint(db_path):
         if request.content_length and request.content_length > 15 * 1024 * 1024:
             raise PrintError('too_large', 413)
         return user
+
+    def page_request():
+        """Same-page checks for requests allowed before sign-in (document conversion)."""
+        token = session.get('print_csrf', '')
+        provided = request.headers.get('X-Print-CSRF', '')
+        origin = request.headers.get('Origin')
+        if not token or not hmac.compare_digest(token.encode(), provided.encode()) or (origin and urlsplit(origin).netloc != request.host):
+            raise PrintError('csrf_failed', 403)
+        if request.mimetype != 'application/json':
+            raise PrintError('bad_input', 415)
+        if request.content_length and request.content_length > 15 * 1024 * 1024:
+            raise PrintError('too_large', 413)
+        return current_user(False)
+
+    def client_ip():
+        # Mirrors app._client_ip: forwarded headers are trusted only from the local proxy.
+        addr = request.remote_addr or 'unknown'
+        if addr in ('127.0.0.1', '::1'):
+            forwarded = (request.headers.get('X-Real-IP') or '').strip() or (request.headers.get('X-Forwarded-For') or '').split(',')[-1].strip()
+            if forwarded:
+                return forwarded
+        return addr
 
     def body():
         data = request.get_json(silent=True)
@@ -176,6 +199,32 @@ def create_blueprint(db_path):
         digest = hashlib.sha256(content).hexdigest()
         token = ticket_signer().dumps({'user': user['id'], 'username': user['school_username'], 'sha256': digest, 'pages': pages})
         return jsonify(pages=pages, bytes=len(content), sha256=digest, inspection_token=token)
+
+    @bp.post('/convert')
+    def convert():
+        user = page_request()
+        if user:
+            store().limit(user['id'], 'convert', 12, 600)
+        else:
+            # Anonymous conversion keeps preview login-free; buckets per address and overall.
+            store().limit(-1 - (zlib.crc32(client_ip().encode()) & 0x7fffffff), 'convert', 6, 600)
+            store().limit(0, 'convert-anonymous', 40, 600)
+        status = ready()
+        if CONVERT not in status['features']:
+            raise PrintError('unsupported_format', 422)
+        data = body()
+        _, ext = decode_document(data.get('document'), data.get('name'))
+        try:
+            result = agent().convert({'document': data['document'], 'ext': ext})
+        except PrintError:
+            raise
+        except Exception:
+            raise PrintError('offline', 503) from None
+        decode_pdf(result.get('pdf'))
+        pages = result.get('pages')
+        if type(pages) is not int or not 1 <= pages <= MAX_PAGES:
+            raise PrintError('convert_failed', 422)
+        return jsonify(pdf=result['pdf'], pages=pages)
 
     @bp.post('/jobs')
     def submit():

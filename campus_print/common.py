@@ -15,6 +15,15 @@ SIDES = ("one-sided", "two-sided-long-edge", "two-sided-short-edge")
 DEFAULT_OPTIONS = {"color": "grayscale", "sides": "one-sided", "copies": 1}
 # Output features an agent must advertise before the cloud forwards them.
 FEATURES = ("color", "duplex", "copies")
+# Office documents and images are converted to PDF on the agent before preview.
+CONVERT = "convert"
+ZIP, OLE = b"PK\x03\x04", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+DOCUMENT_TYPES = {
+    "doc": OLE, "docx": ZIP, "odt": ZIP, "rtf": b"{\\rtf",
+    "ppt": OLE, "pptx": ZIP, "odp": ZIP,
+    "xls": OLE, "xlsx": ZIP, "ods": ZIP,
+    "jpg": b"\xff\xd8\xff", "jpeg": b"\xff\xd8\xff", "png": b"\x89PNG\r\n\x1a\n",
+}
 USERNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 JOB_ID = re.compile(r"[a-f0-9]{32}\Z")
 MESSAGES = {
@@ -36,6 +45,8 @@ MESSAGES = {
     "bad_input": "请求参数不正确，请刷新后重试。",
     "conflict": "同一任务编号对应的文件或打印设置发生变化，请检查任务记录。",
     "unsupported_option": "打印设备暂不支持所选设置，请调整后再试。",
+    "unsupported_format": "暂不支持这种文件，请导出为 PDF 后再试。",
+    "convert_failed": "这份文件无法转换，请导出为 PDF 后再试。",
     "too_many_impressions": f"单次最多打印 {MAX_IMPRESSIONS} 面，请减少份数后再试。",
 }
 
@@ -62,6 +73,27 @@ def decode_pdf(value):
     if len(content) > MAX_BYTES:
         raise PrintError("too_large", 413)
     return content
+
+
+def decode_document(value, name):
+    """Validate an uploaded Office document or image by extension and file signature."""
+    ext = name.rsplit(".", 1)[-1].lower() if isinstance(name, str) and "." in name else ""
+    signature = DOCUMENT_TYPES.get(ext)
+    if signature is None:
+        raise PrintError("unsupported_format", 422)
+    if not isinstance(value, str):
+        raise PrintError("unsupported_format", 422)
+    if len(value) > ((MAX_BYTES + 2) // 3) * 4:
+        raise PrintError("too_large", 413)
+    try:
+        content = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        raise PrintError("unsupported_format", 422) from None
+    if len(content) > MAX_BYTES:
+        raise PrintError("too_large", 413)
+    if not content.startswith(signature):
+        raise PrintError("unsupported_format", 422)
+    return content, ext
 
 
 def parse_options(value, features=FEATURES):

@@ -29,8 +29,9 @@ ProtectControlGroups=yes
 # NoNewPrivileges and the unprivileged service account remain enforced.
 RestrictSUIDSGID=no
 LockPersonality=yes
-MemoryMax=512M
-TasksMax=64
+# LibreOffice conversion needs more headroom than Ghostscript; jobs never overlap.
+MemoryMax=800M
+TasksMax=256
 LimitCORE=0
 TimeoutStopSec=10
 KillMode=control-group

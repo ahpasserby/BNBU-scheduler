@@ -8,6 +8,8 @@ PRINT_SOURCE="$(cd -- "$1" && pwd)"
 test -f "$PRINT_SOURCE/campus_print/agent.py"
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends python3 smbclient ghostscript poppler-utils bubblewrap openssh-client openssl ca-certificates
+# Office documents and images are converted to PDF in the same offline sandbox.
+DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui libreoffice-draw-nogui fonts-noto-cjk fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation2
 id maxcourse-print >/dev/null 2>&1 || useradd --system --home-dir /var/lib/maxcourse-print-agent --shell /usr/sbin/nologin maxcourse-print
 install -d -m 0755 /opt/maxcourse-print-agent
 install -d -m 0700 /etc/maxcourse-print-agent

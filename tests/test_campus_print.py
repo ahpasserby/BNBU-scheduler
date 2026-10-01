@@ -23,10 +23,12 @@ from cryptography.x509.oid import NameOID
 from campus_print import create_print_blueprint
 from campus_print.agent import PrintAgent, add_setup, device_features, handler_for
 from campus_print.client import AgentClient
-from campus_print.common import DEFAULT_OPTIONS, PrintError, parse_options
+from campus_print.common import DEFAULT_OPTIONS, PrintError, decode_document, parse_options
+from campus_print.limits import parse as parse_limits
 from campus_print.store import Store
 
 PDF = base64.b64encode(b'%PDF-1.4\nsynthetic-api-boundary-fixture\n%%EOF').decode()
+DOCX = base64.b64encode(b'PK\x03\x04synthetic-docx-fixture').decode()
 
 
 class FakeAgent:
@@ -40,6 +42,7 @@ class FakeAgent:
         self.options = []
         self.features = []
         self.pages = 2
+        self.converted = []
 
     def health(self):
         return {'ready': self.ready, 'busy': self.busy, 'demo': True, 'features': self.features}
@@ -59,6 +62,10 @@ class FakeAgent:
 
     def job(self, ident):
         return self.jobs[ident]
+
+    def convert(self, payload):
+        self.converted.append(payload['ext'])
+        return {'pdf': PDF, 'pages': 3}
 
 
 class PrintAPITests(unittest.TestCase):
@@ -242,6 +249,48 @@ class PrintAPITests(unittest.TestCase):
         self.assertEqual((result.status_code, result.json['code']), (422, 'too_many_impressions'))
         self.assertEqual(self.agent.calls, 0)
 
+    def convert_request(self, name='report.docx', document=DOCX, token=None, ip='203.0.113.7'):
+        # Requests arrive through the local proxy, which supplies the visitor address.
+        return self.client.post('/api/print/convert', json={'document': document, 'name': name},
+                                headers={'X-Print-CSRF': self.token if token is None else token, 'X-Real-IP': ip},
+                                environ_base={'REMOTE_ADDR': '127.0.0.1'})
+
+    def test_conversion_is_gated_by_agent_feature_and_page_token(self):
+        with self.client.session_transaction() as session:
+            session.pop('user_id', None)
+        self.assertEqual(self.convert_request().json['code'], 'unsupported_format')
+        self.agent.features = ['convert']
+        self.assertEqual(self.client.get('/api/print/session').json['service']['features'], ['convert'])
+        self.assertEqual(self.convert_request(token='forged').status_code, 403)
+        result = self.convert_request()
+        self.assertEqual((result.status_code, result.json['pages'], result.json['pdf']), (200, 3, PDF))
+        self.assertEqual(self.agent.converted, ['docx'])
+        self.assertEqual(self.convert_request(name='notes.txt').json['code'], 'unsupported_format')
+        self.assertEqual(self.convert_request(name='slides.pptx', document=PDF).json['code'], 'unsupported_format')
+        self.agent.ready = False
+        self.assertEqual(self.convert_request().status_code, 503)
+
+    def test_anonymous_conversion_is_rate_limited_per_address(self):
+        self.agent.features = ['convert']
+        with self.client.session_transaction() as session:
+            session.pop('user_id', None)
+        for _ in range(6):
+            self.assertEqual(self.convert_request(ip='203.0.113.9').status_code, 200)
+        self.assertEqual(self.convert_request(ip='203.0.113.9').status_code, 429)
+        self.assertEqual(self.convert_request(ip='198.51.100.4').status_code, 200)
+        Store(self.db)  # Pruning orphaned user rows must keep anonymous buckets.
+        self.assertEqual(self.convert_request(ip='203.0.113.9').status_code, 429)
+
+    def test_document_signatures_and_limits_parsing(self):
+        self.assertEqual(decode_document(DOCX, 'A.DOCX')[1], 'docx')
+        for name, value in (('a.doc', DOCX), ('a.exe', DOCX), ('noext', DOCX), ('a.png', 'not-base64!')):
+            with self.assertRaises(PrintError):
+                decode_document(value, name)
+        self.assertEqual(parse_limits(['--memory', '1536', '--cpu', '100', '--', 'soffice']), (1536, 100, ['soffice']))
+        self.assertEqual(parse_limits(['--', 'gs']), (384, 45, ['gs']))
+        with self.assertRaises(SystemExit):
+            parse_limits(['--memory', '9999', '--', 'gs'])
+
     def test_deleted_user_metadata_is_removed(self):
         self.post('jobs', self.payload())
         with sqlite3.connect(self.db) as conn:
@@ -302,7 +351,37 @@ class AgentTests(unittest.TestCase):
 
     def test_health_advertises_output_features(self):
         self.agent.last_probe=(float('inf'),True)
+        self.agent.convert_ready=False
         self.assertEqual(self.agent.health()['features'],['color','duplex','copies'])
+        self.agent.convert_ready=True
+        self.assertEqual(self.agent.health()['features'],['color','duplex','copies','convert'])
+
+    def test_conversion_runs_libreoffice_in_the_sandbox(self):
+        self.agent.convert_ready=True
+        seen={}
+        def run(command, timeout, memory=None, cpu=None):
+            seen.update(command=command, memory=memory, cpu=cpu)
+            work=Path(command[command.index('--bind')+1])
+            self.assertEqual(sorted(p.name for p in work.iterdir()),['input.docx','out'])
+            (work/'out'/'input.pdf').write_bytes(b'%PDF-1.7 converted')
+        with mock.patch.object(self.agent,'run_limited',side_effect=run), mock.patch.object(self.agent,'pdf_info',return_value=4):
+            result=self.agent.convert_document({'document':DOCX,'ext':'docx'})
+        self.assertEqual((result['pages'],base64.b64decode(result['pdf'])),(4,b'%PDF-1.7 converted'))
+        self.assertIn('--unshare-all',seen['command'])
+        self.assertIn('/usr/bin/soffice',seen['command'])
+        self.assertEqual((seen['memory'],seen['cpu']),(1536,100))
+        self.assertEqual(list(self.agent.runtime_dir.iterdir()),[])
+        with mock.patch.object(self.agent,'run_limited'):
+            with self.assertRaises(PrintError) as caught:
+                self.agent.convert_document({'document':DOCX,'ext':'docx'})
+        self.assertEqual(caught.exception.code,'convert_failed')
+        with self.assertRaises(PrintError) as caught:
+            self.agent.convert_document({'document':PDF,'ext':'docx'})
+        self.assertTrue(caught.exception.unaccepted)
+        self.agent.convert_ready=False
+        with self.assertRaises(PrintError) as caught:
+            self.agent.convert_document({'document':DOCX,'ext':'docx'})
+        self.assertEqual((caught.exception.code,caught.exception.unaccepted),('unsupported_format',True))
 
     def fake_ghostscript(self, body):
         commands=[]
