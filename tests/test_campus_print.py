@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -131,7 +132,7 @@ class PrintAPITests(unittest.TestCase):
     def test_old_processing_state_becomes_unknown_without_retry(self):
         record, _ = Store(self.db).create('e'*32,1,'aged-browser-key-123','digest',1)
         with sqlite3.connect(self.db) as conn:
-            conn.execute('UPDATE campus_print_jobs SET updated_at=updated_at-500 WHERE id=?', (record['id'],))
+            conn.execute('UPDATE campus_print_jobs SET updated_at=updated_at-700 WHERE id=?', (record['id'],))
         self.agent.jobs[record['id']]={'id':record['id'],'state':'processing','code':'processing'}
         self.assertEqual(self.client.get('/api/print/jobs/'+record['id']).json['job']['state'],'unknown')
         self.assertEqual(self.client.get('/api/print/jobs/'+record['id']).json['job']['state'],'unknown')
@@ -553,7 +554,14 @@ class AgentTests(unittest.TestCase):
         key_path=Path(self.tmp.name)/'agent.key'
         cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
         key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()))
-        server=ThreadingHTTPServer(('127.0.0.1',0),handler_for(self.agent,'t'*40))
+        handler = handler_for(self.agent, 't'*40)
+        process_post = handler.process_post
+        def slow_body(request):
+            if request.path == '/v1/inspect':
+                time.sleep(2.5)  # The SSH peer can take longer than TCP connect to drain an upload.
+            return process_post(request)
+        handler.process_post = slow_body
+        server=ThreadingHTTPServer(('127.0.0.1',0),handler)
         context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert_path,key_path)
         server.socket=context.wrap_socket(server.socket,server_side=True,do_handshake_on_connect=False)
@@ -573,6 +581,8 @@ class AgentTests(unittest.TestCase):
             self.assertFalse(AgentClient(url,'t'*40,str(cert_path)).health()['ready'])
             with self.assertRaises(requests.exceptions.SSLError):
                 AgentClient(url,'t'*40).health()
+        with mock.patch.object(self.agent, 'inspect', return_value={'pages': 1}):
+            self.assertEqual(AgentClient(url, 't'*40, str(cert_path)).inspect('A' * (8 * 1024**2)), {'pages': 1})
 
 
 if __name__=='__main__':

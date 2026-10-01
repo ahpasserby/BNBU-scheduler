@@ -20,8 +20,10 @@ class AgentClient:
         # Do not use proxy environment settings for the private tunnel.
         with requests.Session() as client:
             client.trust_env = False
+            # Requests also uses the connect timeout while writing the JSON body.
+            # A 50 MiB file must not inherit the old two-second socket write limit.
             response = client.request(method, self.url + path, json=payload,
-                headers={'Authorization': 'Bearer ' + self.token}, timeout=(2, timeout), allow_redirects=False, verify=self.ca_file)
+                headers={'Authorization': 'Bearer ' + self.token}, timeout=(min(timeout, 120), timeout), allow_redirects=False, verify=self.ca_file)
             if len(response.content) > max_bytes:
                 raise ValueError('Oversized agent response')
             data = response.json()

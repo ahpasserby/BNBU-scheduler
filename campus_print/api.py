@@ -152,11 +152,11 @@ def create_blueprint(db_path):
         if row['state'] in ('processing', 'unknown'):
             try:
                 updated = apply_result(row, agent().job(row['id']))
-                if updated['state'] == 'processing' and time.time() - updated['updated_at'] > 420:
+                if updated['state'] == 'processing' and time.time() - updated['updated_at'] > 660:
                     return store().update(row['id'], row['owner'], 'unknown', 'unknown')
                 return updated
             except Exception:
-                if row['state'] == 'processing' and time.time() - row['updated_at'] > 420:
+                if row['state'] == 'processing' and time.time() - row['updated_at'] > 660:
                     return store().update(row['id'], row['owner'], 'unknown', 'unknown')
         return row
 

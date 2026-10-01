@@ -102,9 +102,9 @@ MAXCOURSE_PRINT_AGENT_TOKEN=THE_SAME_PRIVATE_TOKEN
 
 不要把占位值原样部署。测试模式不能在生产启用。云端仅允许配置回环 HTTPS 执行端，并校验专用执行端证书，同时关闭 Requests 的环境代理继承和自动重定向。即使另一进程占用了同一个回环端口，也无法冒充执行端读取学校密码。公共 API 需要有效登录、学校身份、CSRF、同源检查、页数检查凭证、限流和任务所有权。
 
-现有 Flask 单进程服务会在一次提交中等待设备处理，最长约 360 秒。反向代理的打印 API 请求超时为 390 秒，body limit 为 68 MiB，保留 HTTPS。将本目录 `nginx-location-settings.conf` 的指令应用在打印 API 的代理 location 内，保留现有上游、头部、WAF 和限流配置，再运行 `nginx -t`。当前宝塔部署的完整打印 location 见 `nginx-production-location.conf`，应用到该站点的扩展目录。主机同时存在两个 Nginx，本站使用 `/www/server/nginx/sbin/nginx` 与 `/www/server/nginx/conf/nginx.conf`，验证及重载必须明确指定这一实例。
+现有 Flask 单进程服务会在一次提交中等待设备处理，上传写入最多 120 秒，等待处理结果最多 360 秒。反向代理的打印 API 请求超时为 600 秒，body limit 为 68 MiB，保留 HTTPS。将本目录 `nginx-location-settings.conf` 的指令应用在打印 API 的代理 location 内，保留现有上游、头部、WAF 和限流配置，再运行 `nginx -t`。当前宝塔部署的完整打印 location 见 `nginx-production-location.conf`，应用到该站点的扩展目录。主机同时存在两个 Nginx，本站使用 `/www/server/nginx/sbin/nginx` 与 `/www/server/nginx/conf/nginx.conf`，验证及重载必须明确指定这一实例。
 
-必须关闭请求体磁盘缓冲，并使用 HTTP/1.1 转发和足够的内存缓冲，避免包含学校密码的 JSON 或 PDF 被写入 Nginx 的请求体临时目录。不要开启请求正文日志或把完整请求发送到错误监控。部署验收需一并检查代理层，不只检查 Flask。未来扩大吞吐量时应扩展执行端容量，不能直接重试不确定的任务。
+转换结果的响应同样禁用代理缓冲与临时文件。必须关闭请求体磁盘缓冲，并使用 HTTP/1.1 转发和足够的内存缓冲，避免包含学校密码的 JSON 或 PDF 被写入 Nginx 的请求体临时目录。不要开启请求正文日志或把完整请求发送到错误监控。部署验收需一并检查代理层，不只检查 Flask。未来扩大吞吐量时应扩展执行端容量，不能直接重试不确定的任务。
 
 ## 验收
 
