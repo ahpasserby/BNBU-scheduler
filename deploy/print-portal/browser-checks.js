@@ -92,6 +92,14 @@ async (page) => {
   assert(!/演示同学|本地演示|demo/.test(await page.locator('body').innerText()), 'Demo content in product');
   assert(await page.locator('#doc-panel').isHidden(), 'Preview must wait for a document');
   assert(posts.length === 0, 'Validation submitted a print job');
+  // The page opens on an introduction; the workspace follows the call to action and Back returns.
+  assert(await page.locator('#intro-view').isVisible(), 'Introduction missing');
+  assert(await page.locator('#upload-stage').isHidden(), 'Workspace shown before starting');
+  await page.locator('#start-print').click();
+  await page.locator('#upload-stage').waitFor({ state: 'visible' });
+  assert(page.url().endsWith('#start'), 'Workspace has no history entry');
+  await page.goBack();
+  await page.locator('#intro-view').waitFor({ state: 'visible' });
 
   await fill();
   assert(await page.locator('#confirm-name').textContent() === 'print-portal.pdf', 'Confirmation lost filename');
@@ -351,5 +359,5 @@ async (page) => {
   await page.goto(origin+'/print/');
   await page.getByText('未连接', { exact:true }).waitFor();
   await page.screenshot({ path:'output/playwright/print-portal/redesign-real.png', fullPage:true });
-  return { passed:true, scenarios:26, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
+  return { passed:true, scenarios:27, realPrintJobs:0, realSchoolLogins:0, consoleErrors:errors.length };
 }
