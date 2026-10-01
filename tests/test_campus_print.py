@@ -1,4 +1,5 @@
 import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -23,7 +24,7 @@ from cryptography.x509.oid import NameOID
 from campus_print import create_print_blueprint
 from campus_print.agent import PrintAgent, add_setup, device_features, handler_for
 from campus_print.client import AgentClient
-from campus_print.common import DEFAULT_OPTIONS, PrintError, decode_document, parse_options
+from campus_print.common import DEFAULT_OPTIONS, MAX_BYTES, MAX_REQUEST_BYTES, PrintError, decode_document, parse_options
 from campus_print.limits import parse as parse_limits
 from campus_print.store import Store
 
@@ -130,7 +131,7 @@ class PrintAPITests(unittest.TestCase):
     def test_old_processing_state_becomes_unknown_without_retry(self):
         record, _ = Store(self.db).create('e'*32,1,'aged-browser-key-123','digest',1)
         with sqlite3.connect(self.db) as conn:
-            conn.execute('UPDATE campus_print_jobs SET updated_at=updated_at-200 WHERE id=?', (record['id'],))
+            conn.execute('UPDATE campus_print_jobs SET updated_at=updated_at-500 WHERE id=?', (record['id'],))
         self.agent.jobs[record['id']]={'id':record['id'],'state':'processing','code':'processing'}
         self.assertEqual(self.client.get('/api/print/jobs/'+record['id']).json['job']['state'],'unknown')
         self.assertEqual(self.client.get('/api/print/jobs/'+record['id']).json['job']['state'],'unknown')
@@ -189,7 +190,7 @@ class PrintAPITests(unittest.TestCase):
     def test_bad_pdf_and_oversized_input(self):
         self.assertEqual(self.post('inspect', {'pdf':'not-base64!'}).status_code, 422)
         self.assertEqual(self.post('inspect', {'pdf':base64.b64encode(b'not pdf').decode()}).status_code, 422)
-        self.assertEqual(self.post('inspect', {'pdf':'A'*(14*1024*1024)}).status_code, 413)
+        self.assertEqual(self.post('inspect', {'pdf':'A'*MAX_REQUEST_BYTES}).status_code, 413)
 
     def test_disabled_service_never_calls_agent(self):
         self.app.config['PRINT_ENABLED'] = False
@@ -221,7 +222,7 @@ class PrintAPITests(unittest.TestCase):
         state = self.client.get('/api/print/session').json
         self.assertEqual(state['service']['features'], ['color', 'duplex', 'copies'])
         self.assertIn('two-sided-short-edge', state['capabilities']['sides'])
-        self.assertEqual(state['limits']['max_impressions'], 200)
+        self.assertEqual(state['limits']['max_impressions'], 30000)
         chosen = {'color': 'color', 'sides': 'two-sided-long-edge', 'copies': 3}
         data = self.payload()
         data['options'] = chosen
@@ -237,7 +238,7 @@ class PrintAPITests(unittest.TestCase):
 
     def test_invalid_options_and_impression_limit(self):
         self.agent.features = ['color', 'duplex', 'copies']
-        for options in ({'copies': 0}, {'copies': 21}, {'copies': '2'}, {'copies': True}, {'color': 'sepia'},
+        for options in ({'copies': 0}, {'copies': 101}, {'copies': '2'}, {'copies': True}, {'color': 'sepia'},
                         {'sides': 'two-sided'}, {'staple': True}, ['color']):
             data = self.payload()
             data['options'] = options
@@ -246,7 +247,7 @@ class PrintAPITests(unittest.TestCase):
         data = self.payload('test-idempotency-key-003')
         data['options'] = {'copies': 5}
         result = self.post('jobs', data)
-        self.assertEqual((result.status_code, result.json['code']), (422, 'too_many_impressions'))
+        self.assertEqual((result.status_code, result.json['code']), (422, 'bulk_confirmation_required'))
         self.assertEqual(self.agent.calls, 0)
 
     def convert_request(self, name='report.docx', document=DOCX, token=None, ip='203.0.113.7'):
@@ -287,9 +288,45 @@ class PrintAPITests(unittest.TestCase):
             with self.assertRaises(PrintError):
                 decode_document(value, name)
         self.assertEqual(parse_limits(['--memory', '1536', '--cpu', '100', '--', 'soffice']), (1536, 100, ['soffice']))
-        self.assertEqual(parse_limits(['--', 'gs']), (384, 45, ['gs']))
+        self.assertEqual(parse_limits(['--', 'gs']), (384, 160, ['gs']))
         with self.assertRaises(SystemExit):
             parse_limits(['--memory', '9999', '--', 'gs'])
+
+    def test_large_confirmation_is_bound_to_document_pages_and_options(self):
+        self.agent.features = ['copies', 'duplex']
+        self.agent.pages = 300
+        data = self.payload()
+        options = dict(DEFAULT_OPTIONS, copies=100, sides='two-sided-long-edge')
+        data['options'] = options
+        confirmation = {'sha256': hashlib.sha256(base64.b64decode(PDF)).hexdigest(), 'pages': 300, 'options': options}
+        for invalid in (None, True, dict(confirmation, pages=299), dict(confirmation, sha256='wrong'),
+                        dict(confirmation, options=dict(options, copies=99))):
+            data['bulk_confirmation'] = invalid
+            self.assertEqual(self.post('jobs', data).json['code'], 'bulk_confirmation_required')
+        self.assertEqual((self.agent.calls, Store(self.db).list(1)), (0, []))
+        data['bulk_confirmation'] = confirmation
+        self.assertEqual(self.post('jobs', data).json['job']['state'], 'submitted')
+        # A retry reconciles the accepted intent even after approval/ticket expires.
+        data.pop('bulk_confirmation')
+        data['inspection_token'] = 'expired'
+        self.assertEqual(self.post('jobs', data).json['job']['state'], 'submitted')
+        self.assertEqual(self.agent.calls, 1)
+
+    def test_twenty_one_copies_and_large_pdf_pass_old_boundaries(self):
+        self.agent.features = ['copies']
+        data = self.payload()
+        data['options'] = {'copies': 21}
+        self.assertEqual(self.post('jobs', data).json['job']['options']['copies'], 21)
+        # Raising print requests does not change Flask's global upload limit.
+        self.app.config['MAX_CONTENT_LENGTH'] = 16 * 1024**2
+        document = base64.b64encode(b'%PDF-' + b' ' * (17 * 1024**2)).decode()
+        self.agent.pages = 300
+        response = self.post('inspect', {'pdf': document})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['pages'], 300)
+        self.assertEqual(self.app.config['MAX_CONTENT_LENGTH'], 16 * 1024**2)
+        self.agent.pages = 301
+        self.assertEqual(self.post('inspect', {'pdf': PDF}).status_code, 422)
 
     def test_deleted_user_metadata_is_removed(self):
         self.post('jobs', self.payload())
@@ -349,6 +386,33 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(send.call_count,1)
         self.assertEqual(list(self.agent.runtime_dir.iterdir()), [])
 
+    def test_agent_requires_bulk_confirmation_before_conversion(self):
+        data = {'id': 'c'*32, 'owner': 1, 'username': 't100', 'password': 'example', 'pdf': PDF,
+                'options': dict(DEFAULT_OPTIONS, copies=100)}
+        with mock.patch.object(self.agent, 'health', return_value={'ready': True}), \
+             mock.patch.object(self.agent, 'pdf_info', return_value=300), \
+             mock.patch.object(self.agent, 'convert') as convert, mock.patch.object(self.agent, 'send') as send:
+            with self.assertRaises(PrintError) as caught:
+                self.agent.submit(dict(data))
+            self.assertEqual(caught.exception.code, 'bulk_confirmation_required')
+            self.assertTrue(caught.exception.unaccepted)
+            convert.assert_not_called()
+            send.assert_not_called()
+        self.assertEqual(self.agent.store.list(1), [])
+        self.assertEqual(list(self.agent.runtime_dir.iterdir()), [])
+
+    def test_agent_page_limit_checks_real_pdfinfo_count(self):
+        folder = self.agent.runtime_dir
+        for pages in (51, 300, 301):
+            output = subprocess.CompletedProcess([], 0, f'Pages: {pages}\nEncrypted: no\n'.encode(), b'')
+            with mock.patch.object(self.agent, 'run_limited', return_value=output):
+                if pages <= 300:
+                    self.assertEqual(self.agent.pdf_info(b'%PDF-fixture', folder), pages)
+                else:
+                    with self.assertRaises(PrintError) as caught:
+                        self.agent.pdf_info(b'%PDF-fixture', folder)
+                    self.assertEqual(caught.exception.code, 'too_many_pages')
+
     def test_health_advertises_output_features(self):
         self.agent.last_probe=(float('inf'),True)
         self.agent.convert_ready=False
@@ -369,7 +433,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual((result['pages'],base64.b64decode(result['pdf'])),(4,b'%PDF-1.7 converted'))
         self.assertIn('--unshare-all',seen['command'])
         self.assertIn('/usr/bin/soffice',seen['command'])
-        self.assertEqual((seen['memory'],seen['cpu']),(1536,100))
+        self.assertEqual((seen['memory'],seen['cpu']),(1536,220))
         self.assertEqual(list(self.agent.runtime_dir.iterdir()),[])
         with mock.patch.object(self.agent,'run_limited'):
             with self.assertRaises(PrintError) as caught:
@@ -408,6 +472,19 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(setup.count(b'stopped cleartomark'),3)
         self.assertEqual(sorted(p.name for p in self.work.iterdir()),['maxcourse-'+'d'*32+'.ps'])
 
+    def test_oversized_conversion_stops_before_setup_copy(self):
+        self.work = Path(self.tmp.name) / 'work'
+        self.work.mkdir()
+        def run(command, timeout):
+            output = self.work / ('maxcourse-' + 'a'*32 + '.ps')
+            with output.open('wb') as stream:
+                stream.write(b'%!PS-Adobe')
+                stream.truncate(128 * 1024**2 + 1)
+        with mock.patch.object(self.agent, 'run_limited', side_effect=run), mock.patch('campus_print.agent.add_setup') as setup:
+            with self.assertRaises(ValueError):
+                self.agent.convert(self.work, 'a'*32, dict(DEFAULT_OPTIONS, copies=100))
+            setup.assert_not_called()
+
     def test_existing_setup_section_is_extended_and_missing_position_fails(self):
         self.work=Path(self.tmp.name)/'work'; self.work.mkdir()
         spool=self.work/'job.ps'
@@ -426,7 +503,7 @@ class AgentTests(unittest.TestCase):
     def test_agent_validates_options_and_binds_them_to_the_job(self):
         data={'id':'e'*32,'owner':1,'username':'t100','password':'example','pdf':PDF}
         with self.assertRaises(PrintError) as caught:
-            self.agent.submit(dict(data,options={'copies':99}))
+            self.agent.submit(dict(data,options={'copies':101}))
         self.assertTrue(caught.exception.unaccepted)
         def convert(folder, ident, options):
             seen.append(options); spool=folder/'job.ps'; spool.write_bytes(b'fixture'); return spool

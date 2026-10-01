@@ -72,7 +72,7 @@ class Store:
                 if old['fingerprint'] != digest:
                     raise PrintError('conflict', 409)
                 return dict(old), False
-            active = conn.execute("SELECT COUNT(*) FROM campus_print_jobs WHERE owner=? AND state IN ('processing','sending') AND updated_at>?", (owner, now - 180)).fetchone()[0]
+            active = conn.execute("SELECT COUNT(*) FROM campus_print_jobs WHERE owner=? AND state IN ('processing','sending') AND updated_at>?", (owner, now - 420)).fetchone()[0]
             if active:
                 raise PrintError('active_job', 409)
             count = conn.execute('SELECT COUNT(*) FROM campus_print_jobs WHERE owner=? AND created_at>?', (owner, now - 3600)).fetchone()[0]

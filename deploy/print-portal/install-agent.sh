@@ -26,9 +26,11 @@ p=Path('/etc/maxcourse-print-agent/agent.env')
 fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 with os.fdopen(fd,'w') as out:
     out.write('MAXCOURSE_PRINT_AGENT_TOKEN='+secrets.token_urlsafe(48)+'\n')
-    out.write('PRINT_AGENT_STATE_DIR=/var/lib/maxcourse-print-agent\nPRINT_AGENT_RUNTIME_DIR=/run/maxcourse-print-agent\n')
+    out.write('PRINT_AGENT_STATE_DIR=/var/lib/maxcourse-print-agent\nPRINT_AGENT_RUNTIME_DIR=/tmp/maxcourse-print-agent\n')
 PY
 fi
+# Migrate only the old default, leaving custom paths and secrets untouched.
+sed -i 's|^PRINT_AGENT_RUNTIME_DIR=/run/maxcourse-print-agent$|PRINT_AGENT_RUNTIME_DIR=/tmp/maxcourse-print-agent|' /etc/maxcourse-print-agent/agent.env
 if [[ ! -f /var/lib/maxcourse-print-agent/agent.key ]]; then
     openssl req -x509 -newkey rsa:3072 -nodes -days 730 \
         -subj '/CN=maxcourse-print-agent' \

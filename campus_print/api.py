@@ -13,7 +13,7 @@ from flask import Blueprint, current_app, jsonify, request, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .client import AgentClient
-from .common import CONVERT, DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_IMPRESSIONS, MAX_PAGES, MESSAGES, USERNAME, PrintError, capabilities, decode_document, decode_pdf, encode_options, fingerprint, parse_options, public_job
+from .common import CONVERT, DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_IMPRESSIONS, MAX_PAGES, MAX_REQUEST_BYTES, BULK_CONFIRMATION_THRESHOLD, MESSAGES, USERNAME, PrintError, capabilities, confirm_volume, decode_document, decode_pdf, encode_options, fingerprint, parse_options, public_job
 from .store import Store
 from .maintenance import start_cleaner
 
@@ -24,6 +24,8 @@ def create_blueprint(db_path):
 
     @bp.before_request
     def metadata_cleanup():
+        # Flask 3.1 permits a route-specific ceiling without raising other uploads.
+        request.max_content_length = MAX_REQUEST_BYTES
         if current_app.testing:
             return
         with cleanup_lock:
@@ -99,7 +101,7 @@ def create_blueprint(db_path):
             raise PrintError('csrf_failed', 403)
         if request.mimetype != 'application/json':
             raise PrintError('bad_input', 415)
-        if request.content_length and request.content_length > 15 * 1024 * 1024:
+        if request.content_length and request.content_length > MAX_REQUEST_BYTES:
             raise PrintError('too_large', 413)
         return user
 
@@ -112,7 +114,7 @@ def create_blueprint(db_path):
             raise PrintError('csrf_failed', 403)
         if request.mimetype != 'application/json':
             raise PrintError('bad_input', 415)
-        if request.content_length and request.content_length > 15 * 1024 * 1024:
+        if request.content_length and request.content_length > MAX_REQUEST_BYTES:
             raise PrintError('too_large', 413)
         return current_user(False)
 
@@ -126,7 +128,7 @@ def create_blueprint(db_path):
         return addr
 
     def body():
-        data = request.get_json(silent=True)
+        data = request.get_json(silent=True, cache=False)
         if not isinstance(data, dict):
             raise PrintError('bad_input')
         return data
@@ -150,11 +152,11 @@ def create_blueprint(db_path):
         if row['state'] in ('processing', 'unknown'):
             try:
                 updated = apply_result(row, agent().job(row['id']))
-                if updated['state'] == 'processing' and time.time() - updated['updated_at'] > 180:
+                if updated['state'] == 'processing' and time.time() - updated['updated_at'] > 420:
                     return store().update(row['id'], row['owner'], 'unknown', 'unknown')
                 return updated
             except Exception:
-                if row['state'] == 'processing' and time.time() - row['updated_at'] > 180:
+                if row['state'] == 'processing' and time.time() - row['updated_at'] > 420:
                     return store().update(row['id'], row['owner'], 'unknown', 'unknown')
         return row
 
@@ -177,7 +179,7 @@ def create_blueprint(db_path):
             session['print_csrf'] = secrets.token_urlsafe(32)
         status = service()
         return jsonify(csrf_token=session['print_csrf'], user=current_user(False), service=status,
-                       limits={'max_bytes': MAX_BYTES, 'max_pages': MAX_PAGES, 'max_impressions': MAX_IMPRESSIONS},
+                       limits={'max_bytes': MAX_BYTES, 'max_pages': MAX_PAGES, 'max_impressions': MAX_IMPRESSIONS, 'bulk_confirmation_threshold': BULK_CONFIRMATION_THRESHOLD},
                        capabilities=capabilities(status['features']))
 
     @bp.post('/inspect')
@@ -252,6 +254,7 @@ def create_blueprint(db_path):
             raise PrintError('password_required')
         if inspected['pages'] * options['copies'] > MAX_IMPRESSIONS:
             raise PrintError('too_many_impressions', 422)
+        confirm_volume(data.get('bulk_confirmation'), content, inspected['pages'], options)
         # Only forward options the connected agent advertises; older agents ignore unknown fields.
         parse_options(options, ready()['features'])
         row, created = store().create(secrets.token_hex(16), user['id'], key, digest, inspected['pages'], encode_options(options))
@@ -261,6 +264,8 @@ def create_blueprint(db_path):
                    'password': password, 'pdf': data['pdf']}
         if options != DEFAULT_OPTIONS:
             payload['options'] = options
+        if 'bulk_confirmation' in data:
+            payload['bulk_confirmation'] = data['bulk_confirmation']
         try:
             result = agent().submit(payload)
             row = apply_result(row, result)

@@ -4,11 +4,14 @@ import hashlib
 import json
 import re
 
-MAX_BYTES = 10 * 1024 * 1024
-MAX_PAGES = 50
-MAX_COPIES = 20
-# Printed faces per job (pages x copies), so a typo cannot empty a paper tray.
-MAX_IMPRESSIONS = 200
+MAX_BYTES = 50 * 1024 * 1024
+# Base64 document plus bounded JSON metadata; shared by both HTTP endpoints.
+MAX_REQUEST_BYTES = ((MAX_BYTES + 2) // 3) * 4 + 1024 * 1024
+MAX_PAGES = 300
+MAX_COPIES = 100
+# Printed faces are bounded by document pages and requested copies.
+MAX_IMPRESSIONS = MAX_PAGES * MAX_COPIES
+BULK_CONFIRMATION_THRESHOLD = 200
 RETENTION_SECONDS = 86400
 COLORS = ("grayscale", "color")
 SIDES = ("one-sided", "two-sided-long-edge", "two-sided-short-edge")
@@ -33,8 +36,8 @@ MESSAGES = {
     "auth_failed": "学校账号验证失败，请核对本人的学校密码。",
     "invalid_pdf": "无法读取这份 PDF，请重新导出后再试。",
     "encrypted_pdf": "暂不支持加密 PDF，请先导出一份未加密的文件。",
-    "too_many_pages": "目前每份 PDF 最多支持 50 页。",
-    "too_large": "PDF 不能超过 10 MB。",
+    "too_many_pages": f"每份 PDF 最多支持 {MAX_PAGES} 页。",
+    "too_large": f"文件不能超过 {MAX_BYTES // 1024**2} MB。",
     "offline": "打印设备暂未就绪，请稍后再试。",
     "busy": "打印设备正在处理其他任务，请稍后再试。",
     "rate_limited": "操作较频繁，请稍后再试。",
@@ -47,6 +50,7 @@ MESSAGES = {
     "unsupported_option": "打印设备暂不支持所选设置，请调整后再试。",
     "unsupported_format": "暂不支持这种文件，请导出为 PDF 后再试。",
     "convert_failed": "这份文件无法转换，请导出为 PDF 后再试。",
+    "bulk_confirmation_required": "请确认本次打印总量后再提交。",
     "too_many_impressions": f"单次最多打印 {MAX_IMPRESSIONS} 面，请减少份数后再试。",
 }
 
@@ -133,16 +137,27 @@ def capabilities(features):
         "sides": list(SIDES) if "duplex" in features else ["one-sided"],
         "copies": {"min": 1, "max": MAX_COPIES if "copies" in features else 1},
         "max_impressions": MAX_IMPRESSIONS,
+        "bulk_confirmation_threshold": BULK_CONFIRMATION_THRESHOLD,
     }
 
 
 def fingerprint(content, username, options=None):
     # Default options keep the original digest, so earlier intents still match.
-    digest = hashlib.sha256(username.encode() + b"\0" + content)
+    digest = hashlib.sha256(username.encode() + b"\0")
+    digest.update(content)
     extra = encode_options(options or DEFAULT_OPTIONS)
     if extra:
         digest.update(b"\0" + extra.encode())
     return digest.hexdigest()
+
+
+def confirm_volume(confirmation, content, pages, options):
+    """Bind explicit bulk approval to this document and its exact output options."""
+    if pages * options['copies'] <= BULK_CONFIRMATION_THRESHOLD:
+        return
+    expected = {'sha256': hashlib.sha256(content).hexdigest(), 'pages': pages, 'options': options}
+    if confirmation != expected:
+        raise PrintError('bulk_confirmation_required', 422, True)
 
 
 def public_job(row):

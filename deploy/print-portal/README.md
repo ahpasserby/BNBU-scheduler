@@ -11,7 +11,7 @@
 3. 前端继续使用同一次填写的密码提交文件。后端只使用会话绑定的学校身份。请求完成后清空密码，文档与密码不排队持久保存。
 4. 学校服务确认传输后，状态为“已交给学校队列”。用户需要本人刷卡取件。网站无法确认释放、纸张输出或扣费。
 
-支持 PDF，以及 Word、PPT、Excel、OpenDocument、RTF 与 JPG/PNG 图片（先转换为 PDF），10 MiB 以内、最多 50 页、A4 输出。可选黑白或彩色、单面或双面（长边或短边翻页）、1 至 20 份，单次最多 200 面（页数乘以份数）。默认仍为黑白、单面、单份。没有价格估算或站内付款。任务状态保留约 24 小时，服务运行时每分钟清理过期记录，读取时也会清理。文件名、文件内容和学校密码不存入任务数据库。设备临时文档位于 systemd 创建的 `/run/maxcourse-print-agent`，完成或异常后清理，服务停止及重启也会清理运行目录。
+支持 PDF，以及 Word、PPT、Excel、OpenDocument、RTF 与 JPG/PNG 图片，转换后预览。文件50 MiB 以内、最多 300 页、A4 输出。可选黑白或彩色、单面或双面，双面可选择长边或短边翻页，支持 1 至 100 份。超过 200 面时确认打印总量即可提交。确认绑定当前文件哈希、页数和全部输出设置，修改后需重新确认。默认仍为黑白、单面、单份。没有价格估算或站内付款。任务状态保留约 24 小时，服务运行时每分钟清理过期记录，读取时也会清理。文件名、文件内容和学校密码不存入任务数据库。设备临时文档位于服务专用 tmpfs 中的 `/tmp/maxcourse-print-agent`，目录权限为 0700，完成或异常后清理，服务停止及重启也会销毁临时文件系统。
 
 每个明确的提交意图有一个幂等编号，云端和执行端都去重。提交途中断线或执行端在发送时重启会保留“结果待确认”，不会自动重发。学校明确拒绝认证时才显示密码验证失败。
 
@@ -102,7 +102,7 @@ MAXCOURSE_PRINT_AGENT_TOKEN=THE_SAME_PRIVATE_TOKEN
 
 不要把占位值原样部署。测试模式不能在生产启用。云端仅允许配置回环 HTTPS 执行端，并校验专用执行端证书，同时关闭 Requests 的环境代理继承和自动重定向。即使另一进程占用了同一个回环端口，也无法冒充执行端读取学校密码。公共 API 需要有效登录、学校身份、CSRF、同源检查、页数检查凭证、限流和任务所有权。
 
-现有 Flask 单进程服务会在一次提交中等待设备处理，最长约 150 秒。反向代理的打印 API 请求超时需至少 180 秒，body limit 为 16 MiB，保留 HTTPS。将本目录 `nginx-location-settings.conf` 的指令应用在打印 API 的代理 location 内，保留现有上游、头部、WAF 和限流配置，再运行 `nginx -t`。当前宝塔部署的完整打印 location 见 `nginx-production-location.conf`，应用到该站点的扩展目录。主机同时存在两个 Nginx，本站使用 `/www/server/nginx/sbin/nginx` 与 `/www/server/nginx/conf/nginx.conf`，验证及重载必须明确指定这一实例。
+现有 Flask 单进程服务会在一次提交中等待设备处理，最长约 360 秒。反向代理的打印 API 请求超时为 390 秒，body limit 为 68 MiB，保留 HTTPS。将本目录 `nginx-location-settings.conf` 的指令应用在打印 API 的代理 location 内，保留现有上游、头部、WAF 和限流配置，再运行 `nginx -t`。当前宝塔部署的完整打印 location 见 `nginx-production-location.conf`，应用到该站点的扩展目录。主机同时存在两个 Nginx，本站使用 `/www/server/nginx/sbin/nginx` 与 `/www/server/nginx/conf/nginx.conf`，验证及重载必须明确指定这一实例。
 
 必须关闭请求体磁盘缓冲，并使用 HTTP/1.1 转发和足够的内存缓冲，避免包含学校密码的 JSON 或 PDF 被写入 Nginx 的请求体临时目录。不要开启请求正文日志或把完整请求发送到错误监控。部署验收需一并检查代理层，不只检查 Flask。未来扩大吞吐量时应扩展执行端容量，不能直接重试不确定的任务。
 
@@ -141,7 +141,7 @@ from pathlib import Path
 Path('.codex/broken.pdf').write_bytes(b'not-pdf')
 with open('.codex/too-big.pdf', 'wb') as fixture:
     fixture.write(b'%PDF-1.7')
-    fixture.truncate(10485761)
+    fixture.truncate(52428801)
 from pypdf import PdfReader, PdfWriter
 writer = PdfWriter()
 for page in PdfReader('tests/fixtures/print-preview-pages.pdf').pages:
@@ -149,7 +149,7 @@ for page in PdfReader('tests/fixtures/print-preview-pages.pdf').pages:
 writer.encrypt('synthetic-test-password')
 writer.write('.codex/encrypted.pdf')
 writer = PdfWriter()
-for _ in range(51):
+for _ in range(301):
     writer.add_blank_page(width=595, height=842)
 writer.write('.codex/too-many-pages.pdf')
 writer = PdfWriter()
@@ -160,3 +160,11 @@ PYTEST
 ```
 
 本次部署的实机沙箱、隧道、证书及单账号实体打印已通过。第二个真实学校账号、整机重启和长时间运行尚未单独现场验收；更换设备或线路后需重新验证。
+
+## 2026-10-01 容量放宽
+
+请求上限包含 50 MiB 文件的 Base64 编码及 1 MiB JSON 元数据空间。Flask 3.1 仅为打印蓝图设置请求上限，其余上传接口保留原有 16 MiB 上限。执行端同时只接收一个大请求，健康和任务查询仍可使用。打印选项与不确定结果的幂等去重规则不变。
+
+部署顺序为设备、Nginx、云端代码。设备服务使用 384 MiB 专用 tmpfs 和 800 MiB 总内存上限。安装脚本仅将旧默认运行目录迁移到新路径，不修改自定义路径。PDF 检查最长 25 秒，转换最长 180 秒，向学校传输最长 120 秒。超过资源上限的复杂文档仍会明确失败，不会自动重复发送。
+
+`check-large-document.py` 生成包含 300 个独立彩色图像的 50 MiB PDF，验证真实 pdfinfo、黑白及彩色 PostScript 转换、100 份与双面设置和临时文件清理。必须在使用生产资源限制的隔离 systemd 单元中运行，设置 `PYTHONPATH` 为待测代码目录。脚本没有学校账号输入或队列发送路径，不会实际打印 100 份。

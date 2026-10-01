@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from .common import CONVERT, DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_COPIES, MAX_PAGES, USERNAME, PrintError, decode_document, decode_pdf, encode_options, fingerprint, parse_options, public_job
+from .common import CONVERT, DEFAULT_OPTIONS, FEATURES, JOB_ID, MAX_BYTES, MAX_COPIES, MAX_PAGES, MAX_REQUEST_BYTES, USERNAME, PrintError, confirm_volume, decode_document, decode_pdf, encode_options, fingerprint, parse_options, public_job
 from .store import Store
 from .maintenance import start_cleaner
 
@@ -96,7 +96,7 @@ class PrintAgent:
     def pdf_info(self, content, folder):
         (folder / 'document.pdf').write_bytes(content)
         try:
-            output = self.run_limited(self.sandbox(folder, ['/usr/bin/pdfinfo', '/work/document.pdf']), 12).stdout.decode('utf-8', 'replace')
+            output = self.run_limited(self.sandbox(folder, ['/usr/bin/pdfinfo', '/work/document.pdf']), 25).stdout.decode('utf-8', 'replace')
         except subprocess.CalledProcessError as exc:
             diagnostic = (exc.stderr or b'').lower()
             raise PrintError('encrypted_pdf' if b'password' in diagnostic else 'invalid_pdf', 422) from None
@@ -113,7 +113,7 @@ class PrintAgent:
         return pages
 
     def inspect(self, data):
-        content = decode_pdf(data.get('pdf'))
+        content = decode_pdf(data.pop('pdf', None))
         if not self.sandbox_ready:
             raise PrintError('offline', 503, True)
         if not self.lock.acquire(blocking=False):
@@ -127,7 +127,7 @@ class PrintAgent:
     def convert_document(self, data):
         """Convert one Office document or image to PDF inside the offline sandbox."""
         try:
-            content, ext = decode_document(data.get('document'), 'input.' + str(data.get('ext', '')))
+            content, ext = decode_document(data.pop('document', None), 'input.' + str(data.get('ext', '')))
         except PrintError as exc:
             exc.unaccepted = True
             raise
@@ -140,11 +140,12 @@ class PrintAgent:
                 folder = Path(name)
                 (folder / 'out').mkdir()
                 (folder / ('input.' + ext)).write_bytes(content)
+                del content
                 command = ['/usr/bin/soffice', '--headless', '--norestore', '--nolockcheck', '--nodefault', '--nologo',
                            '-env:UserInstallation=file:///tmp/libreoffice', '--convert-to', 'pdf',
                            '--outdir', '/work/out', '/work/input.' + ext]
                 try:
-                    self.run_limited(self.sandbox(folder, command, 'C.UTF-8'), 110, memory=1536, cpu=100)
+                    self.run_limited(self.sandbox(folder, command, 'C.UTF-8'), 240, memory=1536, cpu=220)
                 except (OSError, subprocess.SubprocessError):
                     raise PrintError('convert_failed', 422) from None
                 output = folder / 'out' / 'input.pdf'
@@ -170,7 +171,11 @@ class PrintAgent:
                    *color, '-sPAPERSIZE=a4',
                    '-dFIXEDMEDIA', '-dPDFFitPage', '-dNumCopies=1', '-dDuplex=false',
                    '-sOutputFile=/work/' + spool.name, '/work/document.pdf']
-        self.run_limited(self.sandbox(folder, command), 55)
+        self.run_limited(self.sandbox(folder, command), 180)
+        # Ghostscript scratch files can exceed the final output size. Keep the
+        # final spool bounded before setup insertion makes a second copy.
+        if spool.stat().st_size > 128 * 1024**2:
+            raise ValueError('Converted PostScript exceeds spool capacity')
         with spool.open('rb') as stream:
             if stream.read(10) != b'%!PS-Adobe':
                 raise ValueError('Invalid converted PostScript')
@@ -190,7 +195,7 @@ class PrintAgent:
                        '-U', username, '-t', '15', '-d', '1', '--option=client min protocol=SMB2', '--use-kerberos=off',
                        '-c', 'print ' + spool.name]
             result = subprocess.run(command, cwd=spool.parent, env=env, pass_fds=(reader,),
-                                    capture_output=True, timeout=60)
+                                    capture_output=True, timeout=120)
             output = (result.stdout + result.stderr).decode('utf-8', 'replace')
             # These session-setup failures occur before any file can be sent.
             if any(status in output for status in ('NT_STATUS_LOGON_FAILURE','NT_STATUS_WRONG_PASSWORD',
@@ -211,7 +216,7 @@ class PrintAgent:
         username, password = data.get('username', ''), data.get('password')
         if not isinstance(ident, str) or not JOB_ID.fullmatch(ident) or type(owner) is not int or owner < 1 or not isinstance(username, str) or not USERNAME.fullmatch(username):
             raise PrintError('bad_input', 400, True)
-        content = decode_pdf(data.get('pdf'))
+        content = decode_pdf(data.pop('pdf', None))
         try:
             options = parse_options(data.get('options'))
         except PrintError:
@@ -233,6 +238,8 @@ class PrintAgent:
             with tempfile.TemporaryDirectory(dir=self.runtime_dir) as folder_name:
                 folder = Path(folder_name)
                 pages = self.pdf_info(content, folder)
+                confirm_volume(data.get('bulk_confirmation'), content, pages, options)
+                del content
                 row, fresh = self.store.create(ident, owner, ident, digest, pages, encode_options(options))
                 if not fresh:
                     return public_job(row)
@@ -303,7 +310,7 @@ def add_setup(spool, features):
 
 
 def handler_for(agent, token):
-    incoming = threading.BoundedSemaphore(2)
+    incoming = threading.BoundedSemaphore(1)
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -360,11 +367,11 @@ def handler_for(agent, token):
                 if agent.lock.locked():
                     raise PrintError('busy', 503, True)
                 length = int(self.headers.get('Content-Length', '0'))
-                if length < 1 or length > 15 * 1024 * 1024:
+                if length < 1 or length > MAX_REQUEST_BYTES:
                     raise PrintError('too_large', 413, True)
                 if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                     raise PrintError('bad_input', 415, True)
-                self.connection.settimeout(12)
+                self.connection.settimeout(120)
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise PrintError('bad_input', 400, True)
@@ -397,7 +404,7 @@ def main():
     context.load_cert_chain(os.environ.get('PRINT_AGENT_CERT', '/var/lib/maxcourse-print-agent/agent.crt'),
                             os.environ.get('PRINT_AGENT_KEY', '/var/lib/maxcourse-print-agent/agent.key'))
     agent = PrintAgent(os.environ.get('PRINT_AGENT_STATE_DIR', '/var/lib/maxcourse-print-agent'),
-                       os.environ.get('PRINT_AGENT_RUNTIME_DIR', '/run/maxcourse-print-agent'),
+                       os.environ.get('PRINT_AGENT_RUNTIME_DIR', '/tmp/maxcourse-print-agent'),
                        os.environ.get('PRINT_SMB_SERVER', '172.16.244.66'),
                        os.environ.get('PRINT_SMB_SHARE', 'DP'), os.environ.get('PRINT_SMB_DOMAIN', 'UIC'))
     server = ThreadingHTTPServer(('127.0.0.1', args.port), handler_for(agent, token))

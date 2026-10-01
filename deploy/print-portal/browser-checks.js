@@ -1,6 +1,6 @@
 async (page) => {
-  if (!page.url().startsWith('http://127.0.0.1:5019/')) throw new Error('Use the local application.');
-  const origin = 'http://127.0.0.1:5019';
+  if (new URL(page.url()).hostname !== '127.0.0.1') throw new Error('Use the local application.');
+  const origin = new URL(page.url()).origin;
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -24,7 +24,7 @@ async (page) => {
   const docx = { name: 'report.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', buffer: Buffer.from('PK\u0003\u0004synthetic-docx') };
   const converts = [];
   let user = null, jobs = [], online = true, failLogin = false, reply = 'submitted', features = allFeatures;
-  let loginCalls = 0, inspectionCalls = 0;
+  let loginCalls = 0, inspectionCalls = 0, inspectedPages = 1;
   let holdLogin = null;
   const posts = [];
   let holdHistory = null;
@@ -36,10 +36,10 @@ async (page) => {
     if (path === '/api/print/session') return json({
       csrf_token: 'browser-test-token', user,
       service: { enabled: true, ready: online, online, busy: false, demo: false, features: online ? features : [] },
-      limits: { max_bytes: 10485760, max_pages: 50, max_impressions: 200 },
+      limits: { max_bytes: 52428800, max_pages: 300, max_impressions: 30000, bulk_confirmation_threshold: 200 },
       capabilities: { paper: 'A4', color: features.includes('color') ? ['grayscale', 'color'] : ['grayscale'],
         sides: features.includes('duplex') ? ['one-sided', 'two-sided-long-edge', 'two-sided-short-edge'] : ['one-sided'],
-        copies: { min: 1, max: features.includes('copies') ? 20 : 1 }, max_impressions: 200 },
+        copies: { min: 1, max: features.includes('copies') ? 100 : 1 }, max_impressions: 30000 },
     });
     if (path === '/api/login/ispace') {
       loginCalls++;
@@ -55,11 +55,11 @@ async (page) => {
     }
     if (path === '/api/print/inspect') {
       inspectionCalls++;
-      return json({ pages: 1, inspection_token: 'browser-inspection-ticket' });
+      return json({ pages: inspectedPages, inspection_token: 'browser-inspection-ticket', sha256: 'browser-document-hash' });
     }
     if (path === '/api/print/jobs' && req.method() === 'POST') {
       const input = req.postDataJSON();
-      posts.push({ key: input.idempotency_key, passwordPresent: input.password === 'test-only', user: req.headers()['x-print-user'], options: input.options, pdf: input.pdf });
+      posts.push({ key: input.idempotency_key, passwordPresent: input.password === 'test-only', user: req.headers()['x-print-user'], options: input.options, pdf: input.pdf, confirmation: input.bulk_confirmation });
       if (reply === 'timeout') return route.fulfill({ status: 504, contentType: 'text/plain', body: 'Gateway timeout' });
       const job = { id: String(posts.length).padStart(32, '0'), idempotency_key: input.idempotency_key,
         state: reply, pages: 1, options: input.options, created_at: Date.now() / 1000, updated_at: Date.now() / 1000 };
@@ -166,7 +166,7 @@ async (page) => {
   await page.locator('#file-input').setInputFiles('.codex/broken.pdf');
   await page.locator('#file-error').filter({hasText:/无法生成|无法读取/}).waitFor();
   await page.locator('#file-input').setInputFiles('.codex/too-big.pdf');
-  await page.getByText('文件超过 10 MB，请压缩后再试。', { exact: true }).waitFor();
+  await page.getByText('文件超过 50 MB，请压缩后再试。', { exact: true }).waitFor();
 
   // Exercise delayed FileReader completion after a newer selection.
   await page.evaluate(() => {
@@ -205,6 +205,7 @@ async (page) => {
   await page.waitForFunction(() => parseFloat(document.getElementById('preview-canvas').style.width) > 800);
   await page.locator('#zoom-fit').click();
   await page.locator('#zoom-fit').filter({hasText:'适合'}).waitFor();
+  await page.locator('#doc-progress').waitFor({state:'hidden'});
   await page.locator('#page-current').fill('1');
   await page.locator('#page-current').press('Enter');
   await page.locator('#preview-canvas[data-page="1"]').waitFor({state:'visible'});
@@ -213,7 +214,7 @@ async (page) => {
   await page.locator('#file-error').filter({hasText:'加密 PDF'}).waitFor();
   assert(await page.locator('#doc-panel').isHidden(), 'Encrypted document remained printable');
   await page.locator('#file-input').setInputFiles('.codex/too-many-pages.pdf');
-  await page.locator('#file-error').filter({hasText:'51 页'}).waitFor();
+  await page.locator('#file-error').filter({hasText:'301 页'}).waitFor();
   assert(await page.locator('#doc-panel').isHidden(), 'Over-limit document remained printable');
 
   // Output options change the preview and travel with the print intent.
@@ -289,15 +290,32 @@ async (page) => {
   await page.getByText('打印服务已连接', { exact: true }).waitFor();
   assert(await page.getByRole('radio', { name: '黑白' }).isChecked(), 'Unsupported colour was not reverted');
 
-  // The copy cap follows the 200-face limit for long documents.
-  await reset();
-  await page.locator('#file-input').setInputFiles('.codex/fifty-pages.pdf');
-  await page.locator('#doc-sub').filter({hasText:'50 页'}).waitFor();
-  await page.locator('#copies').fill('9');
-  await page.locator('#copies').press('Enter');
-  assert(await page.locator('#copies').inputValue() === '4', 'Copies not capped at 200 faces');
-  assert(await page.locator('#copies-inc').isDisabled(), 'Copy cap still adjustable');
-  assert(await page.locator('#copies-note').textContent() === '最多 4 份', 'Copy cap note missing');
+  // Long documents allow 100 copies, with document-bound bulk approval.
+  await reset(); inspectedPages = 300;
+  await page.locator('#file-input').setInputFiles('.codex/three-hundred-pages.pdf');
+  await page.locator('#doc-sub').filter({hasText:'300 页'}).waitFor();
+  await page.locator('#copies').fill('100');
+  await page.locator('#copies').press('Tab');
+  assert(await page.locator('#copies').inputValue() === '100', 'Old copy/face cap remains');
+  await page.locator('#go-print').click();
+  await page.getByLabel('学号', {exact: true}).fill('t_test1');
+  await page.getByLabel('密码', {exact: true}).fill('test-only');
+  const beforeBulk = posts.length;
+  await page.locator('#submit-btn').click();
+  assert(posts.length === beforeBulk, 'Bulk job bypassed approval');
+  assert((await page.locator('#bulk-label').textContent()).includes('30000 面'), 'Bulk summary incorrect');
+  await page.locator('#bulk-check').check();
+  await page.locator('#account-back').click();
+  await page.locator('#copies').fill('99');
+  await page.locator('#copies').press('Tab');
+  await page.locator('#go-print').click();
+  assert(!await page.locator('#bulk-check').isChecked(), 'Changed settings kept approval');
+  await page.getByLabel('密码', {exact: true}).fill('test-only');
+  await page.locator('#bulk-check').check();
+  await page.locator('#submit-btn').click();
+  await page.getByRole('heading', { name: '文件已提交，去刷卡取件吧' }).waitFor();
+  assert(posts.at(-1).confirmation.pages === 300 && posts.at(-1).confirmation.options.copies === 99, 'Bulk approval payload incorrect');
+  inspectedPages = 1;
 
   await reset();
   // Realistic authenticated history remains collapsed and follows the typed ID.

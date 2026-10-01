@@ -6,7 +6,7 @@ import sys
 
 def parse(args):
     """Return (memory MiB, CPU seconds, command) from `[--memory N] [--cpu N] -- command...`."""
-    memory, cpu = 384, 45
+    memory, cpu = 384, 160
     while args and args[0] in ('--memory', '--cpu'):
         flag, value, args = args[0], int(args[1]), args[2:]
         if not 64 <= value <= 4096:
@@ -26,7 +26,7 @@ def main():
     memory, cpu, args = parse(sys.argv[1:])
     resource.setrlimit(resource.RLIMIT_AS, (memory * 1024**2, memory * 1024**2))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024**2, 256 * 1024**2))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.execvpe(args[0], args, os.environ)
 

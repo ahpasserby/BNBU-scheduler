@@ -1,7 +1,7 @@
 from urllib.parse import urlsplit
 import requests
 
-from .common import PrintError
+from .common import MAX_REQUEST_BYTES, PrintError
 
 
 class AgentClient:
@@ -28,7 +28,7 @@ class AgentClient:
             if not isinstance(data, dict):
                 raise ValueError('Invalid agent response')
             if response.status_code >= 400:
-                raise PrintError(data.get('code') if data.get('code') in ('busy','offline','invalid_pdf','encrypted_pdf','too_many_pages','too_large','conflict','rate_limited','auth_rate_limited','active_job','unsupported_format','convert_failed') else 'offline', response.status_code, unaccepted=data.get('accepted') is False)
+                raise PrintError(data.get('code') if data.get('code') in ('busy','offline','invalid_pdf','encrypted_pdf','too_many_pages','too_large','conflict','rate_limited','auth_rate_limited','active_job','unsupported_format','convert_failed','bulk_confirmation_required') else 'offline', response.status_code, unaccepted=data.get('accepted') is False)
             if response.status_code != 200:
                 raise ValueError('Unexpected agent response')
             return data
@@ -37,14 +37,14 @@ class AgentClient:
         return self.call('GET', '/v1/health')
 
     def inspect(self, pdf):
-        return self.call('POST', '/v1/inspect', {'pdf': pdf}, 30)
+        return self.call('POST', '/v1/inspect', {'pdf': pdf}, 150)
 
     def submit(self, payload):
-        return self.call('POST', '/v1/jobs', payload, 150)
+        return self.call('POST', '/v1/jobs', payload, 360)
 
     def convert(self, payload):
-        # A converted PDF is returned inline, up to the 10 MiB document limit.
-        return self.call('POST', '/v1/convert', payload, 130, max_bytes=16 * 1024 * 1024)
+        # A converted PDF is returned inline, up to the shared document limit.
+        return self.call('POST', '/v1/convert', payload, 360, max_bytes=MAX_REQUEST_BYTES)
 
     def job(self, ident):
         return self.call('GET', '/v1/jobs/' + ident)

@@ -19,6 +19,8 @@ UMask=0077
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# Dedicated RAM-backed scratch space, discarded with the service namespace.
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=384M,mode=1777
 NoNewPrivileges=yes
 # Bubblewrap mounts a private /proc inside its own user/PID namespace.
 # Masking the parent /proc prevents that mount on the supported ARM kernel.
